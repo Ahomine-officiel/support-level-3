@@ -1,7 +1,7 @@
 {
  "asset": {
   "version": "2.0",
-  "generator": "sl3-tools"
+  "generator": "sl3-tools-v2"
  },
  "scene": 0,
  "scenes": [
@@ -28,6 +28,51 @@
      },
      "indices": 4,
      "material": 0
+    },
+    {
+     "attributes": {
+      "POSITION": 0,
+      "NORMAL": 1,
+      "TEXCOORD_0": 2
+     },
+     "indices": 5,
+     "material": 0
+    },
+    {
+     "attributes": {
+      "POSITION": 0,
+      "NORMAL": 1,
+      "TEXCOORD_0": 2
+     },
+     "indices": 6,
+     "material": 0
+    },
+    {
+     "attributes": {
+      "POSITION": 0,
+      "NORMAL": 1,
+      "TEXCOORD_0": 2
+     },
+     "indices": 7,
+     "material": 0
+    },
+    {
+     "attributes": {
+      "POSITION": 0,
+      "NORMAL": 1,
+      "TEXCOORD_0": 2
+     },
+     "indices": 8,
+     "material": 0
+    },
+    {
+     "attributes": {
+      "POSITION": 0,
+      "NORMAL": 1,
+      "TEXCOORD_0": 2
+     },
+     "indices": 9,
+     "material": 0
     }
    ],
    "name": "ceil"
@@ -45,14 +90,14 @@
    "count": 24,
    "type": "VEC3",
    "min": [
+    -4.0,
     -1.0,
-    3.0,
-    -1.0
+    -4.0
    ],
    "max": [
-    1.0,
-    3.0999999999999996,
-    1.0
+    5.0,
+    7.05,
+    4.0
    ]
   },
   {
@@ -77,7 +122,42 @@
    "bufferView": 3,
    "byteOffset": 0,
    "componentType": 5125,
-   "count": 36,
+   "count": 6,
+   "type": "SCALAR"
+  },
+  {
+   "bufferView": 3,
+   "byteOffset": 24,
+   "componentType": 5125,
+   "count": 6,
+   "type": "SCALAR"
+  },
+  {
+   "bufferView": 3,
+   "byteOffset": 48,
+   "componentType": 5125,
+   "count": 6,
+   "type": "SCALAR"
+  },
+  {
+   "bufferView": 3,
+   "byteOffset": 72,
+   "componentType": 5125,
+   "count": 6,
+   "type": "SCALAR"
+  },
+  {
+   "bufferView": 3,
+   "byteOffset": 96,
+   "componentType": 5125,
+   "count": 6,
+   "type": "SCALAR"
+  },
+  {
+   "bufferView": 3,
+   "byteOffset": 120,
+   "componentType": 5125,
+   "count": 6,
    "type": "SCALAR"
   }
  ],

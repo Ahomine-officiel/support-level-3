@@ -98,7 +98,7 @@ pub fn load_font(device: &wgpu::Device, queue: &wgpu::Queue) -> (super::texture:
         );
     }
 
-    let tex = super::texture::load_png(device, queue, path);
+    let tex = super::texture::load_png_opts(device, queue, path, false);
     (
         tex,
         FontData {

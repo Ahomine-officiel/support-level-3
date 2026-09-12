@@ -1,7 +1,7 @@
 {
  "asset": {
   "version": "2.0",
-  "generator": "sl3-tools"
+  "generator": "sl3-tools-v2"
  },
  "scene": 0,
  "scenes": [
@@ -46,6 +46,60 @@
      },
      "indices": 6,
      "material": 0
+    },
+    {
+     "attributes": {
+      "POSITION": 0,
+      "NORMAL": 1,
+      "TEXCOORD_0": 2
+     },
+     "indices": 7,
+     "material": 0
+    },
+    {
+     "attributes": {
+      "POSITION": 0,
+      "NORMAL": 1,
+      "TEXCOORD_0": 2
+     },
+     "indices": 8,
+     "material": 0
+    },
+    {
+     "attributes": {
+      "POSITION": 0,
+      "NORMAL": 1,
+      "TEXCOORD_0": 2
+     },
+     "indices": 9,
+     "material": 0
+    },
+    {
+     "attributes": {
+      "POSITION": 0,
+      "NORMAL": 1,
+      "TEXCOORD_0": 2
+     },
+     "indices": 10,
+     "material": 0
+    },
+    {
+     "attributes": {
+      "POSITION": 0,
+      "NORMAL": 1,
+      "TEXCOORD_0": 2
+     },
+     "indices": 11,
+     "material": 0
+    },
+    {
+     "attributes": {
+      "POSITION": 0,
+      "NORMAL": 1,
+      "TEXCOORD_0": 2
+     },
+     "indices": 12,
+     "material": 1
     }
    ],
    "name": "receipt"
@@ -54,41 +108,44 @@
  "materials": [
   {
    "name": "receipt_paper"
+  },
+  {
+   "name": "metal_dark"
   }
  ],
  "accessors": [
   {
    "bufferView": 0,
    "componentType": 5126,
-   "count": 12,
+   "count": 110,
    "type": "VEC3",
    "min": [
-    -0.12,
-    0.012,
-    -0.13
+    -0.1330881000391977,
+    -0.0379,
+    -0.11904961622432857
    ],
    "max": [
-    0.13,
-    0.036,
-    0.14
+    0.14820573684732835,
+    0.14600000000000002,
+    0.13062461339457862
    ]
   },
   {
    "bufferView": 1,
    "componentType": 5126,
-   "count": 12,
+   "count": 110,
    "type": "VEC3"
   },
   {
    "bufferView": 2,
    "componentType": 5126,
-   "count": 12,
+   "count": 110,
    "type": "VEC2"
   },
   {
    "bufferView": 3,
    "componentType": 5125,
-   "count": 18,
+   "count": 180,
    "type": "SCALAR"
   },
   {
@@ -111,38 +168,80 @@
    "componentType": 5125,
    "count": 6,
    "type": "SCALAR"
+  },
+  {
+   "bufferView": 3,
+   "byteOffset": 72,
+   "componentType": 5125,
+   "count": 6,
+   "type": "SCALAR"
+  },
+  {
+   "bufferView": 3,
+   "byteOffset": 96,
+   "componentType": 5125,
+   "count": 6,
+   "type": "SCALAR"
+  },
+  {
+   "bufferView": 3,
+   "byteOffset": 120,
+   "componentType": 5125,
+   "count": 6,
+   "type": "SCALAR"
+  },
+  {
+   "bufferView": 3,
+   "byteOffset": 144,
+   "componentType": 5125,
+   "count": 36,
+   "type": "SCALAR"
+  },
+  {
+   "bufferView": 3,
+   "byteOffset": 288,
+   "componentType": 5125,
+   "count": 36,
+   "type": "SCALAR"
+  },
+  {
+   "bufferView": 3,
+   "byteOffset": 432,
+   "componentType": 5125,
+   "count": 72,
+   "type": "SCALAR"
   }
  ],
  "bufferViews": [
   {
    "buffer": 0,
    "byteOffset": 0,
-   "byteLength": 144,
+   "byteLength": 1320,
    "target": 34962
   },
   {
    "buffer": 0,
-   "byteOffset": 144,
-   "byteLength": 144,
+   "byteOffset": 1320,
+   "byteLength": 1320,
    "target": 34962
   },
   {
    "buffer": 0,
-   "byteOffset": 288,
-   "byteLength": 96,
+   "byteOffset": 2640,
+   "byteLength": 880,
    "target": 34962
   },
   {
    "buffer": 0,
-   "byteOffset": 384,
-   "byteLength": 72,
+   "byteOffset": 3520,
+   "byteLength": 720,
    "target": 34963
   }
  ],
  "buffers": [
   {
    "uri": "receipt.bin",
-   "byteLength": 456
+   "byteLength": 4240
   }
  ]
 }

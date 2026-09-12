@@ -1,0 +1,794 @@
+     1→     1→//! Renderer wgpu : pipeline monde (instances + matériaux), post-process, UI.
+     2→     2→
+     3→     3→pub mod model;
+     4→     4→pub mod texture;
+     5→     5→pub mod ui;
+     6→     6→pub use ui::UiOp;
+     7→     7→
+     8→     8→use model::{Model, Vertex};
+     9→     9→use std::collections::HashMap;
+    10→    10→use std::path::Path;
+    11→    11→use winit::window::Window;
+    12→    12→use wgpu::util::DeviceExt;
+    13→    13→
+    14→    14→pub const MAX_LIGHTS: usize = 24;
+    15→    15→
+    16→    16→#[repr(C)]
+    17→    17→#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+    18→    18→pub struct WorldUniform {
+    19→    19→    pub view_proj: [[f32; 4]; 4],
+    20→    20→    pub cam_pos: [f32; 4],
+    21→    21→    pub light_pos: [[f32; 4]; MAX_LIGHTS],
+    22→    22→    pub light_col: [[f32; 4]; MAX_LIGHTS],
+    23→    23→    pub flash_pos: [f32; 4],
+    24→    24→    pub flash_dir: [f32; 4],
+    25→    25→    pub misc: [f32; 4],
+    26→    26→    pub flash_col: [f32; 4],
+    27→    27→}
+    28→    28→
+    29→    29→#[repr(C)]
+    30→    30→#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+    31→    31→pub struct InstanceRaw {
+    32→    32→    pub m: [[f32; 4]; 4],
+    33→    33→    pub emissive: [f32; 4],
+    34→    34→    pub tint: [f32; 4],
+    35→    35→}
+    36→    36→
+    37→    37→pub const INSTANCE_LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::VertexBufferLayout {
+    38→    38→    array_stride: std::mem::size_of::<InstanceRaw>() as u64,
+    39→    39→    step_mode: wgpu::VertexStepMode::Instance,
+    40→    40→    attributes: &[
+    41→    41→        wgpu::VertexAttribute { offset: 0, shader_location: 3, format: wgpu::VertexFormat::Float32x4 },
+    42→    42→        wgpu::VertexAttribute { offset: 16, shader_location: 4, format: wgpu::VertexFormat::Float32x4 },
+    43→    43→        wgpu::VertexAttribute { offset: 32, shader_location: 5, format: wgpu::VertexFormat::Float32x4 },
+    44→    44→        wgpu::VertexAttribute { offset: 48, shader_location: 6, format: wgpu::VertexFormat::Float32x4 },
+    45→    45→        wgpu::VertexAttribute { offset: 64, shader_location: 7, format: wgpu::VertexFormat::Float32x4 },
+    46→    46→        wgpu::VertexAttribute { offset: 80, shader_location: 8, format: wgpu::VertexFormat::Float32x4 },
+    47→    47→    ],
+    48→    48→};
+    49→    49→
+    50→    50→#[derive(Clone)]
+    51→    51→pub struct InstanceData {
+    52→    52→    pub model: glam::Mat4,
+    53→    53→    pub emissive: [f32; 4],
+    54→    54→    pub tint: [f32; 4],
+    55→    55→}
+    56→    56→
+    57→    57→impl InstanceData {
+    58→    58→    pub fn new(model: glam::Mat4) -> Self {
+    59→    59→        InstanceData { model, emissive: [1.0, 1.0, 1.0, 1.0], tint: [1.0, 1.0, 1.0, 1.0] }
+    60→    60→    }
+    61→    61→    pub fn with_emissive(mut self, e: [f32; 4]) -> Self {
+    62→    62→        self.emissive = e;
+    63→    63→        self
+    64→    64→    }
+    65→    65→    pub fn with_tint(mut self, t: [f32; 4]) -> Self {
+    66→    66→        self.tint = t;
+    67→    67→        self
+    68→    68→    }
+    69→    69→    fn raw(&self) -> InstanceRaw {
+    70→    70→        InstanceRaw {
+    71→    71→            m: self.model.to_cols_array_2d(),
+    72→    72→            emissive: self.emissive,
+    73→    73→            tint: self.tint,
+    74→    74→        }
+    75→    75→    }
+    76→    76→}
+    77→    77→
+    78→    78→/// (fichier texture sans extension, force émissive du matériau).
+    79→    79→pub fn material_def(name: &str) -> (String, f32) {
+    80→    80→    let strength = match name {
+    81→    81→        "led_strip" => 2.0,
+    82→    82→        "screen_on" => 0.8,
+    83→    83→        "terminal_screen" => 0.9,
+    84→    84→        "exit_sign" => 1.4,
+    85→    85→        "eyes" => 2.6,
+    86→    86→        "light_panel" => 1.25,
+    87→    87→        "battery" => 0.35,
+    88→    88→        "receipt_paper" => 0.05,
+    89→    89→        "poster_a" | "poster_b" | "poster_c" | "poster_d" => 0.04,
+    90→    90→        "entity_mask" => 0.03,
+    91→    91→        _ => 0.0,
+    92→    92→    };
+    93→    93→    (name.to_string(), strength)
+    94→    94→}
+    95→    95→
+    96→    96→#[derive(PartialEq, Eq, Hash, Clone)]
+    97→    97→pub struct PartKey {
+    98→    98→    pub model: String,
+    99→    99→    pub part: usize,
+   100→   100→}
+   101→   101→
+   102→   102→pub struct StaticBatch {
+   103→   103→    pub key: PartKey,
+   104→   104→    pub buffer: wgpu::Buffer,
+   105→   105→    pub count: u32,
+   106→   106→}
+   107→   107→
+   108→   108→pub struct StaticBatches {
+   109→   109→    pub batches: Vec<StaticBatch>,
+   110→   110→    pub total_instances: usize,
+   111→   111→}
+   112→   112→
+   113→   113→pub struct Renderer {
+   114→   114→    pub device: wgpu::Device,
+   115→   115→    pub queue: wgpu::Queue,
+   116→   116→    surface: wgpu::Surface<'static>,
+   117→   117→    surface_config: wgpu::SurfaceConfiguration,
+   118→   118→    pub window: std::sync::Arc<Window>,
+   119→   119→    pub models: HashMap<String, Model>,
+   120→   120→
+   121→   121→    world_pipeline: wgpu::RenderPipeline,
+   122→   122→    world_bind0: wgpu::BindGroup,
+   123→   123→    world_uniform_buf: wgpu::Buffer,
+   124→   124→    material_bind_groups: HashMap<String, wgpu::BindGroup>,
+   125→   125→
+   126→   126→    post_pipeline: wgpu::RenderPipeline,
+   127→   127→    post_bind: wgpu::BindGroup,
+   128→   128→    post_uniform_buf: wgpu::Buffer,
+   129→   129→    offscreen_view: wgpu::TextureView,
+   130→   130→    offscreen_tex: wgpu::Texture,
+   131→   131→    depth_view: wgpu::TextureView,
+   132→   132→    depth_tex: wgpu::Texture,
+   133→   133→
+   134→   134→    ui_pipeline: wgpu::RenderPipeline,
+   135→   135→    ui_bind0: wgpu::BindGroup,
+   136→   136→    ui_uniform_buf: wgpu::Buffer,
+   137→   137→    pub font_bg: wgpu::BindGroup,
+   138→   138→    pub white_bg: wgpu::BindGroup,
+   139→   139→    pub font: ui::FontData,
+   140→   140→    ui_buf: wgpu::Buffer,
+   141→   141→
+   142→   142→    dyn_scratch: HashMap<PartKey, (wgpu::Buffer, u64)>,
+   143→   143→}
+   144→   144→
+   145→   145→impl Renderer {
+   146→   146→    pub fn new(window: std::sync::Arc<Window>) -> Renderer {
+   147→   147→        let size = window.inner_size();
+   148→   148→        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
+   149→   149→        let surface = instance
+   150→   150→            .create_surface(window.clone())
+   151→   151→            .expect("création surface");
+   152→   152→        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+   153→   153→            power_preference: wgpu::PowerPreference::HighPerformance,
+   154→   154→            compatible_surface: Some(&surface),
+   155→   155→            force_fallback_adapter: false,
+   156→   156→        }))
+   157→   157→        .expect("pas de GPU compatible (Vulkan/Metal/DX12 requis)");
+   158→   158→
+   159→   159→        let (device, queue) = pollster::block_on(adapter.request_device(
+   160→   160→            &wgpu::DeviceDescriptor {
+   161→   161→                label: Some("sl3-device"),
+   162→   162→                required_features: wgpu::Features::empty(),
+   163→   163→                required_limits: wgpu::Limits::default(),
+   164→   164→                memory_hints: wgpu::MemoryHints::Performance,
+   165→   165→            },
+   166→   166→            None,
+   167→   167→        ))
+   168→   168→        .expect("création device");
+   169→   169→
+   170→   170→        let caps = surface.get_capabilities(&adapter);
+   171→   171→        let format = caps
+   172→   172→            .formats
+   173→   173→            .iter()
+   174→   174→            .find(|f| f.is_srgb())
+   175→   175→            .copied()
+   176→   176→            .unwrap_or(caps.formats[0]);
+   177→   177→        let surface_config = wgpu::SurfaceConfiguration {
+   178→   178→            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+   179→   179→            format,
+   180→   180→            width: size.width.max(1),
+   181→   181→            height: size.height.max(1),
+   182→   182→            present_mode: wgpu::PresentMode::Fifo,
+   183→   183→            alpha_mode: caps.alpha_modes[0],
+   184→   184→            view_formats: vec![],
+   185→   185→            desired_maximum_frame_latency: 2,
+   186→   186→        };
+   187→   187→        surface.configure(&device, &surface_config);
+   188→   188→
+   189→   189→        // Modèles + matériaux.
+   190→   190→        let models = model::load_all_models(&device);
+   191→   191→        let mut material_bind_groups = HashMap::new();
+   192→   192→        let mat_layout = Self::material_layout(&device);
+   193→   193→        for name in [
+   194→   194→            "concrete", "concrete_dark", "floor_hall", "floor_corridor", "floor_office",
+   195→   195→            "floor_server", "floor_arch", "floor_elec", "ceiling", "metal_dark",
+   196→   196→            "rack_front", "server_front", "led_strip", "screen_off", "screen_on",
+   197→   197→            "terminal_screen", "desk_wood", "terminal_body", "chair_fabric", "door_metal",
+   198→   198→            "door_frame", "shelf_metal", "cardboard", "entity_cloth", "entity_mask",
+   199→   199→            "eyes", "tech_vest", "tech_pants", "tech_head", "receipt_paper",
+   200→   200→            "breaker_panel", "exit_sign", "battery", "extinguisher", "duct",
+   201→   201→            "light_panel", "hazard", "poster_a", "poster_b", "poster_c", "poster_d",
+   202→   202→        ] {
+   203→   203→            let (file, strength) = material_def(name);
+   204→   204→            let path = Path::new("assets/textures").join(format!("{file}.png"));
+   205→   205→            let tex = texture::load_png(&device, &queue, &path);
+   206→   206→            let mat_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+   207→   207→                label: None,
+   208→   208→                contents: bytemuck::cast_slice(&[1.0f32, 1.0, 1.0, strength]),
+   209→   209→                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+   210→   210→            });
+   211→   211→            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+   212→   212→                label: Some(name),
+   213→   213→                layout: &mat_layout,
+   214→   214→                entries: &[
+   215→   215→                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::Sampler(&Self::world_sampler(&device)) },
+   216→   216→                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&tex.view) },
+   217→   217→                    wgpu::BindGroupEntry { binding: 2, resource: mat_buf.as_entire_binding() },
+   218→   218→                ],
+   219→   219→            });
+   220→   220→            material_bind_groups.insert(name.to_string(), bg);
+   221→   221→        }
+   222→   222→
+   223→   223→        // Uniforms monde.
+   224→   224→        let world_uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+   225→   225→            label: Some("world-uniform"),
+   226→   226→            contents: bytemuck::bytes_of(&WorldUniform {
+   227→   227→                view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
+   228→   228→                cam_pos: [0.0; 4],
+   229→   229→                light_pos: [[0.0; 4]; MAX_LIGHTS],
+   230→   230→                light_col: [[0.0; 4]; MAX_LIGHTS],
+   231→   231→                flash_pos: [0.0; 4],
+   232→   232→                flash_dir: [0.0; 4],
+   233→   233→                misc: [0.0; 4],
+   234→   234→                flash_col: [0.0; 4],
+   235→   235→            }),
+   236→   236→            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+   237→   237→        });
+   238→   238→        let world_bind_layout = Self::world_bind_layout(&device);
+   239→   239→        let world_bind0 = device.create_bind_group(&wgpu::BindGroupDescriptor {
+   240→   240→            label: Some("world-bind0"),
+   241→   241→            layout: &world_bind_layout,
+   242→   242→            entries: &[wgpu::BindGroupEntry {
+   243→   243→                binding: 0,
+   244→   244→                resource: world_uniform_buf.as_entire_binding(),
+   245→   245→            }],
+   246→   246→        });
+   247→   247→
+   248→   248→        let world_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+   249→   249→            label: Some("world.wgsl"),
+   250→   250→            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/world.wgsl").into()),
+   251→   251→        });
+   252→   252→        let world_pipeline = Self::world_pipeline(&device, &world_bind_layout, &mat_layout, &world_shader, format);
+   253→   253→
+   254→   254→        // Post-process.
+   255→   255→        let post_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+   256→   256→            label: Some("post.wgsl"),
+   257→   257→            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/post.wgsl").into()),
+   258→   258→        });
+   259→   259→        let post_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+   260→   260→            label: Some("post-layout"),
+   261→   261→            entries: &[
+   262→   262→                wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
+   263→   263→                wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
+   264→   264→                wgpu::BindGroupLayoutEntry { binding: 2, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, multisampled: false, view_dimension: wgpu::TextureViewDimension::D2 }, count: None },
+   265→   265→            ],
+   266→   266→        });
+   267→   267→        let post_uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+   268→   268→            label: Some("post-uniform"),
+   269→   269→            contents: bytemuck::cast_slice(&[0.0f32; 4]),
+   270→   270→            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+   271→   271→        });
+   272→   272→
+   273→   273→        let (offscreen_tex, offscreen_view) = Self::make_offscreen(&device, size.width.max(1), size.height.max(1), format);
+   274→   274→        let (depth_tex, depth_view) = Self::make_depth(&device, size.width.max(1), size.height.max(1));
+   275→   275→
+   276→   276→        let post_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+   277→   277→            label: Some("post-bind"),
+   278→   278→            layout: &post_layout,
+   279→   279→            entries: &[
+   280→   280→                wgpu::BindGroupEntry { binding: 0, resource: post_uniform_buf.as_entire_binding() },
+   281→   281→                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&texture::linear_sampler(&device, false)) },
+   282→   282→                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&offscreen_view) },
+   283→   283→            ],
+   284→   284→        });
+   285→   285→        let post_pipeline = Self::post_pipeline(&device, &post_layout, &post_shader, format);
+   286→   286→
+   287→   287→        // UI.
+   288→   288→        let ui_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+   289→   289→            label: Some("ui.wgsl"),
+   290→   290→            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/ui.wgsl").into()),
+   291→   291→        });
+   292→   292→        let ui_layout0 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+   293→   293→            label: Some("ui-layout0"),
+   294→   294→            entries: &[wgpu::BindGroupLayoutEntry {
+   295→   295→                binding: 0,
+   296→   296→                visibility: wgpu::ShaderStages::VERTEX,
+   297→   297→                ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+   298→   298→                count: None,
+   299→   299→            }],
+   300→   300→        });
+   301→   301→        let ui_layout1 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+   302→   302→            label: Some("ui-layout1"),
+   303→   303→            entries: &[
+   304→   304→                wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
+   305→   305→                wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, multisampled: false, view_dimension: wgpu::TextureViewDimension::D2 }, count: None },
+   306→   306→            ],
+   307→   307→        });
+   308→   308→        let ui_uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+   309→   309→            label: Some("ui-uniform"),
+   310→   310→            contents: bytemuck::cast_slice(&[size.width as f32, size.height as f32, 0.0, 0.0]),
+   311→   311→            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+   312→   312→        });
+   313→   313→        let ui_bind0 = device.create_bind_group(&wgpu::BindGroupDescriptor {
+   314→   314→            label: Some("ui-bind0"),
+   315→   315→            layout: &ui_layout0,
+   316→   316→            entries: &[wgpu::BindGroupEntry { binding: 0, resource: ui_uniform_buf.as_entire_binding() }],
+   317→   317→        });
+   318→   318→        let white_tex = texture::white_texture(&device, &queue);
+   319→   319→        let white_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+   320→   320→            label: Some("ui-white"),
+   321→   321→            layout: &ui_layout1,
+   322→   322→            entries: &[
+   323→   323→                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::Sampler(&texture::linear_sampler(&device, false)) },
+   324→   324→                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&white_tex.view) },
+   325→   325→            ],
+   326→   326→        });
+   327→   327→        let (font_tex, font) = ui::load_font(&device, &queue);
+   328→   328→        let font_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+   329→   329→            label: Some("ui-font"),
+   330→   330→            layout: &ui_layout1,
+   331→   331→            entries: &[
+   332→   332→                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::Sampler(&texture::linear_sampler(&device, false)) },
+   333→   333→                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&font_tex.view) },
+   334→   334→            ],
+   335→   335→        });
+   336→   336→        let ui_pipeline = Self::ui_pipeline(&device, &ui_layout0, &ui_layout1, &ui_shader, format);
+   337→   337→        let ui_buf = device.create_buffer(&wgpu::BufferDescriptor {
+   338→   338→            label: Some("ui-verts"),
+   339→   339→            size: (4 * 4096 * std::mem::size_of::<ui::UiVertex>() as u64).max(64),
+   340→   340→            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+   341→   341→            mapped_at_creation: false,
+   342→   342→        });
+   343→   343→
+   344→   344→        Renderer {
+   345→   345→            device,
+   346→   346→            queue,
+   347→   347→            surface,
+   348→   348→            surface_config,
+   349→   349→            window,
+   350→   350→            models,
+   351→   351→            world_pipeline,
+   352→   352→            world_bind0,
+   353→   353→            world_uniform_buf,
+   354→   354→            material_bind_groups,
+   355→   355→            post_pipeline,
+   356→   356→            post_bind,
+   357→   357→            post_uniform_buf,
+   358→   358→            offscreen_view,
+   359→   359→            offscreen_tex,
+   360→   360→            depth_view,
+   361→   361→            depth_tex,
+   362→   362→            ui_pipeline,
+   363→   363→            ui_bind0,
+   364→   364→            ui_uniform_buf,
+   365→   365→            font_bg,
+   366→   366→            white_bg,
+   367→   367→            font,
+   368→   368→            ui_buf,
+   369→   369→            dyn_scratch: HashMap::new(),
+   370→   370→        }
+   371→   371→    }
+   372→   372→
+   373→   373→    // ---------- helpers de création ----------
+   374→   374→    fn world_sampler(device: &wgpu::Device) -> wgpu::Sampler {
+   375→   375→        texture::linear_sampler(device, true)
+   376→   376→    }
+   377→   377→
+   378→   378→    fn world_bind_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+   379→   379→        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+   380→   380→            label: Some("world-layout0"),
+   381→   381→            entries: &[wgpu::BindGroupLayoutEntry {
+   382→   382→                binding: 0,
+   383→   383→                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+   384→   384→                ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+   385→   385→                count: None,
+   386→   386→            }],
+   387→   387→        })
+   388→   388→    }
+   389→   389→
+   390→   390→    fn material_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+   391→   391→        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+   392→   392→            label: Some("world-layout1"),
+   393→   393→            entries: &[
+   394→   394→                wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
+   395→   395→                wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, multisampled: false, view_dimension: wgpu::TextureViewDimension::D2 }, count: None },
+   396→   396→                wgpu::BindGroupLayoutEntry { binding: 2, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
+   397→   397→            ],
+   398→   398→        })
+   399→   399→    }
+   400→   400→
+   401→   401→    fn world_pipeline(
+   402→   402→        device: &wgpu::Device,
+   403→   403→        bind0: &wgpu::BindGroupLayout,
+   404→   404→        bind1: &wgpu::BindGroupLayout,
+   405→   405→        shader: &wgpu::ShaderModule,
+   406→   406→        format: wgpu::TextureFormat,
+   407→   407→    ) -> wgpu::RenderPipeline {
+   408→   408→        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+   409→   409→            label: Some("world-pll"),
+   410→   410→            bind_group_layouts: &[bind0, bind1],
+   411→   411→            push_constant_ranges: &[],
+   412→   412→        });
+   413→   413→        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+   414→   414→            label: Some("world-pipeline"),
+   415→   415→            layout: Some(&layout),
+   416→   416→            vertex: wgpu::VertexState {
+   417→   417→                module: shader,
+   418→   418→                entry_point: "vs",
+   419→   419→                buffers: &[Vertex::LAYOUT, INSTANCE_LAYOUT],
+   420→   420→                compilation_options: Default::default(),
+   421→   421→            },
+   422→   422→            fragment: Some(wgpu::FragmentState {
+   423→   423→                module: shader,
+   424→   424→                entry_point: "fs",
+   425→   425→                targets: &[Some(wgpu::ColorTargetState {
+   426→   426→                    format,
+   427→   427→                    blend: None,
+   428→   428→                    write_mask: wgpu::ColorWrites::ALL,
+   429→   429→                })],
+   430→   430→                compilation_options: Default::default(),
+   431→   431→            }),
+   432→   432→            primitive: wgpu::PrimitiveState::default(),
+   433→   433→            depth_stencil: Some(wgpu::DepthStencilState {
+   434→   434→                format: wgpu::TextureFormat::Depth24Plus,
+   435→   435→                depth_write_enabled: true,
+   436→   436→                depth_compare: wgpu::CompareFunction::Less,
+   437→   437→                stencil: Default::default(),
+   438→   438→                bias: Default::default(),
+   439→   439→            }),
+   440→   440→            multisample: Default::default(),
+   441→   441→            multiview: None,
+   442→   442→            cache: None,
+   443→   443→        })
+   444→   444→    }
+   445→   445→
+   446→   446→    fn post_pipeline(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, shader: &wgpu::ShaderModule, format: wgpu::TextureFormat) -> wgpu::RenderPipeline {
+   447→   447→        let pll = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+   448→   448→            label: Some("post-pll"),
+   449→   449→            bind_group_layouts: &[layout],
+   450→   450→            push_constant_ranges: &[],
+   451→   451→        });
+   452→   452→        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+   453→   453→            label: Some("post-pipeline"),
+   454→   454→            layout: Some(&pll),
+   455→   455→            vertex: wgpu::VertexState {
+   456→   456→                module: shader,
+   457→   457→                entry_point: "vs",
+   458→   458→                buffers: &[],
+   459→   459→                compilation_options: Default::default(),
+   460→   460→            },
+   461→   461→            fragment: Some(wgpu::FragmentState {
+   462→   462→                module: shader,
+   463→   463→                entry_point: "fs",
+   464→   464→                targets: &[Some(wgpu::ColorTargetState {
+   465→   465→                    format,
+   466→   466→                    blend: None,
+   467→   467→                    write_mask: wgpu::ColorWrites::ALL,
+   468→   468→                })],
+   469→   469→                compilation_options: Default::default(),
+   470→   470→            }),
+   471→   471→            primitive: wgpu::PrimitiveState { cull_mode: None, ..Default::default() },
+   472→   472→            depth_stencil: None,
+   473→   473→            multisample: Default::default(),
+   474→   474→            multiview: None,
+   475→   475→            cache: None,
+   476→   476→        })
+   477→   477→    }
+   478→   478→
+   479→   479→    fn ui_pipeline(device: &wgpu::Device, l0: &wgpu::BindGroupLayout, l1: &wgpu::BindGroupLayout, shader: &wgpu::ShaderModule, format: wgpu::TextureFormat) -> wgpu::RenderPipeline {
+   480→   480→        use ui::UiVertex;
+   481→   481→        let pll = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+   482→   482→            label: Some("ui-pll"),
+   483→   483→            bind_group_layouts: &[l0, l1],
+   484→   484→            push_constant_ranges: &[],
+   485→   485→        });
+   486→   486→        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+   487→   487→            label: Some("ui-pipeline"),
+   488→   488→            layout: Some(&pll),
+   489→   489→            vertex: wgpu::VertexState {
+   490→   490→                module: shader,
+   491→   491→                entry_point: "vs",
+   492→   492→                buffers: &[UiVertex::LAYOUT],
+   493→   493→                compilation_options: Default::default(),
+   494→   494→            },
+   495→   495→            fragment: Some(wgpu::FragmentState {
+   496→   496→                module: shader,
+   497→   497→                entry_point: "fs",
+   498→   498→                targets: &[Some(wgpu::ColorTargetState {
+   499→   499→                    format,
+   500→   500→                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+   501→   501→                    write_mask: wgpu::ColorWrites::ALL,
+   502→   502→                })],
+   503→   503→                compilation_options: Default::default(),
+   504→   504→            }),
+   505→   505→            primitive: wgpu::PrimitiveState { cull_mode: None, ..Default::default() },
+   506→   506→            depth_stencil: None,
+   507→   507→            multisample: Default::default(),
+   508→   508→            multiview: None,
+   509→   509→            cache: None,
+   510→   510→        })
+   511→   511→    }
+   512→   512→
+   513→   513→    fn make_offscreen(device: &wgpu::Device, w: u32, h: u32, format: wgpu::TextureFormat) -> (wgpu::Texture, wgpu::TextureView) {
+   514→   514→        let tex = device.create_texture(&wgpu::TextureDescriptor {
+   515→   515→            label: Some("offscreen"),
+   516→   516→            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+   517→   517→            mip_level_count: 1,
+   518→   518→            sample_count: 1,
+   519→   519→            dimension: wgpu::TextureDimension::D2,
+   520→   520→            format,
+   521→   521→            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+   522→   522→            view_formats: &[],
+   523→   523→        });
+   524→   524→        let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+   525→   525→        (tex, view)
+   526→   526→    }
+   527→   527→
+   528→   528→    fn make_depth(device: &wgpu::Device, w: u32, h: u32) -> (wgpu::Texture, wgpu::TextureView) {
+   529→   529→        let tex = device.create_texture(&wgpu::TextureDescriptor {
+   530→   530→            label: Some("depth"),
+   531→   531→            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+   532→   532→            mip_level_count: 1,
+   533→   533→            sample_count: 1,
+   534→   534→            dimension: wgpu::TextureDimension::D2,
+   535→   535→            format: wgpu::TextureFormat::Depth24Plus,
+   536→   536→            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+   537→   537→            view_formats: &[],
+   538→   538→        });
+   539→   539→        let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+   540→   540→        (tex, view)
+   541→   541→    }
+   542→   542→
+   543→   543→    pub fn size(&self) -> (u32, u32) {
+   544→   544→        (self.surface_config.width, self.surface_config.height)
+   545→   545→    }
+   546→   546→
+   547→   547→    pub fn resize(&mut self, w: u32, h: u32) {
+   548→   548→        let (w, h) = (w.max(1), h.max(1));
+   549→   549→        self.surface_config.width = w;
+   550→   550→        self.surface_config.height = h;
+   551→   551→        self.surface.configure(&self.device, &self.surface_config);
+   552→   552→        let (t, v) = Self::make_offscreen(&self.device, w, h, self.surface_config.format);
+   553→   553→        self.offscreen_tex = t;
+   554→   554→        self.offscreen_view = v;
+   555→   555→        let post_layout = self.post_pipeline.get_bind_group_layout(0);
+   556→   556→        self.post_bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+   557→   557→            label: Some("post-bind"),
+   558→   558→            layout: &post_layout,
+   559→   559→            entries: &[
+   560→   560→                wgpu::BindGroupEntry { binding: 0, resource: self.post_uniform_buf.as_entire_binding() },
+   561→   561→                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&texture::linear_sampler(&self.device, false)) },
+   562→   562→                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&self.offscreen_view) },
+   563→   563→            ],
+   564→   564→        });
+   565→   565→        let (dt, dv) = Self::make_depth(&self.device, w, h);
+   566→   566→        self.depth_tex = dt;
+   567→   567→        self.depth_view = dv;
+   568→   568→        let ui_data = [w as f32, h as f32, 0.0, 0.0];
+   569→   569→        self.queue.write_buffer(&self.ui_uniform_buf, 0, bytemuck::cast_slice(&ui_data));
+   570→   570→    }
+   571→   571→
+   572→   572→    // ---------- construction des batchs statiques ----------
+   573→   573→    pub fn build_static(&self, insts: &[(String, InstanceData)]) -> StaticBatches {
+   574→   574→        let mut groups: HashMap<PartKey, Vec<InstanceRaw>> = HashMap::new();
+   575→   575→        for (model_name, inst) in insts {
+   576→   576→            if let Some(model) = self.models.get(model_name) {
+   577→   577→                for (pi, part) in model.parts.iter().enumerate() {
+   578→   578→                    groups
+   579→   579→                        .entry(PartKey { model: model_name.clone(), part: pi })
+   580→   580→                        .or_default()
+   581→   581→                        .push(inst.raw());
+   582→   582→                    let _ = &part.mat;
+   583→   583→                }
+   584→   584→            }
+   585→   585→        }
+   586→   586→        let mut batches = Vec::new();
+   587→   587→        let mut total = 0usize;
+   588→   588→        for (key, raws) in groups {
+   589→   589→            let buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+   590→   590→                label: Some("static-instances"),
+   591→   591→                contents: bytemuck::cast_slice(&raws),
+   592→   592→                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+   593→   593→            });
+   594→   594→            total += raws.len();
+   595→   595→            batches.push(StaticBatch { key, buffer, count: raws.len() as u32 });
+   596→   596→        }
+   597→   597→        StaticBatches { batches, total_instances: total }
+   598→   598→    }
+   599→   599→
+   600→   600→    // ---------- dessin ----------
+   601→   601→    pub fn draw_instances_pass(
+   602→   602→        &mut self,
+   603→   603→        pass: &mut wgpu::RenderPass<'static>,
+   604→   604→        statics: &StaticBatches,
+   605→   605→        dynamics: &[(String, Vec<InstanceData>)],
+   606→   606→    ) {
+   607→   607→        pass.set_pipeline(&self.world_pipeline);
+   608→   608→        pass.set_bind_group(0, &self.world_bind0, &[]);
+   609→   609→
+   610→   610→        // Statiques.
+   611→   611→        for batch in &statics.batches {
+   612→   612→            self.draw_part(pass, &batch.key, &batch.buffer, batch.count);
+   613→   613→        }
+   614→   614→
+   615→   615→        // Dynamiques.
+   616→   616→        for (model_name, insts) in dynamics {
+   617→   617→            let Some(model) = self.models.get(model_name) else { continue };
+   618→   618→            for (pi, _part) in model.parts.iter().enumerate() {
+   619→   619→                if insts.is_empty() {
+   620→   620→                    continue;
+   621→   621→                }
+   622→   622→                let key = PartKey { model: model_name.clone(), part: pi };
+   623→   623→                let raws: Vec<InstanceRaw> = insts.iter().map(|i| i.raw()).collect();
+   624→   624→                let bytes_needed = (raws.len() * std::mem::size_of::<InstanceRaw>()) as u64;
+   625→   625→                let needs_grow = self
+   626→   626→                    .dyn_scratch
+   627→   627→                    .get(&key)
+   628→   628→                    .map(|(_, cap)| *cap < bytes_needed)
+   629→   629→                    .unwrap_or(true);
+   630→   630→                if needs_grow {
+   631→   631→                    let cap = bytes_needed.max(1024);
+   632→   632→                    let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+   633→   633→                        label: Some("dyn-instances"),
+   634→   634→                        size: cap,
+   635→   635→                        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+   636→   636→                        mapped_at_creation: false,
+   637→   637→                    });
+   638→   638→                    self.dyn_scratch.insert(key.clone(), (buf, cap));
+   639→   639→                }
+   640→   640→                let (buf, _cap) = &self.dyn_scratch[&key];
+   641→   641→                self.queue.write_buffer(buf, 0, bytemuck::cast_slice(&raws));
+   642→   642→                self.draw_part(pass, &key, buf, raws.len() as u32);
+   643→   643→            }
+   644→   644→        }
+   645→   645→    }
+   646→   646→
+   647→   647→    fn draw_part(
+   648→   648→        &self,
+   649→   649→        pass: &mut wgpu::RenderPass<'static>,
+   650→   650→        key: &PartKey,
+   651→   651→        instance_buf: &wgpu::Buffer,
+   652→   652→        count: u32,
+   653→   653→    ) {
+   654→   654→        let Some(model) = self.models.get(&key.model) else { return };
+   655→   655→        let Some(part) = model.parts.get(key.part) else { return };
+   656→   656→        let Some(bg) = self.material_bind_groups.get(&part.mat) else { return };
+   657→   657→        pass.set_bind_group(1, bg, &[]);
+   658→   658→        pass.set_vertex_buffer(0, part.vertex_buf.slice(..));
+   659→   659→        pass.set_vertex_buffer(1, instance_buf.slice(..));
+   660→   660→        pass.set_index_buffer(part.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+   661→   661→        pass.draw_indexed(0..part.count, 0, 0..count);
+   662→   662→    }
+   663→   663→
+   664→   664→    #[allow(clippy::too_many_arguments)]
+   665→   665→    pub fn render(
+   666→   666→        &mut self,
+   667→   667→        world_uniform: &WorldUniform,
+   668→   668→        statics: &StaticBatches,
+   669→   669→        dynamics: &[(String, Vec<InstanceData>)],
+   670→   670→        ui_ops: &[ui::UiOp],
+   671→   671→        post_params: [f32; 4],
+   672→   672→    ) -> Result<(), wgpu::SurfaceError> {
+   673→   673→        let frame = self.surface.get_current_texture()?;
+   674→   674→        let frame_view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
+   675→   675→
+   676→   676→        self.queue
+   677→   677→            .write_buffer(&self.world_uniform_buf, 0, bytemuck::bytes_of(world_uniform));
+   678→   678→        self.queue
+   679→   679→            .write_buffer(&self.post_uniform_buf, 0, bytemuck::cast_slice(&post_params));
+   680→   680→
+   681→   681→        // Quads UI.
+   682→   682→        let (verts, draws) = ui::build_ui_verts(ui_ops, &self.font);
+   683→   683→        if !verts.is_empty() {
+   684→   684→            let bytes_needed = (verts.len() * std::mem::size_of::<ui::UiVertex>()) as u64;
+   685→   685→            if self.ui_buf.size() < bytes_needed {
+   686→   686→                self.ui_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+   687→   687→                    label: Some("ui-verts"),
+   688→   688→                    size: bytes_needed * 2,
+   689→   689→                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+   690→   690→                    mapped_at_creation: false,
+   691→   691→                });
+   692→   692→            }
+   693→   693→            self.queue.write_buffer(&self.ui_buf, 0, bytemuck::cast_slice(&verts));
+   694→   694→        }
+   695→   695→
+   696→   696→        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+   697→   697→            label: Some("frame"),
+   698→   698→        });
+   699→   699→
+   700→   700→        // 1) Monde -> offscreen.
+   701→   701→        {
+   702→   702→            let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+   703→   703→                label: Some("world-pass"),
+   704→   704→                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+   705→   705→                    view: &self.offscreen_view,
+   706→   706→                    resolve_target: None,
+   707→   707→                    ops: wgpu::Operations {
+   708→   708→                        load: wgpu::LoadOp::Clear(wgpu::Color {
+   709→   709→                            r: 0.004,
+   710→   710→                            g: 0.005,
+   711→   711→                            b: 0.008,
+   712→   712→                            a: 1.0,
+   713→   713→                        }),
+   714→   714→                        store: wgpu::StoreOp::Store,
+   715→   715→                    },
+   716→   716→                })],
+   717→   717→                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+   718→   718→                    view: &self.depth_view,
+   719→   719→                    depth_ops: Some(wgpu::Operations {
+   720→   720→                        load: wgpu::LoadOp::Clear(1.0),
+   721→   721→                        store: wgpu::StoreOp::Store,
+   722→   722→                    }),
+   723→   723→                    stencil_ops: None,
+   724→   724→                }),
+   725→   725→                timestamp_writes: None,
+   726→   726→                occlusion_query_set: None,
+   727→   727→            });
+   728→   728→            // 'pass borrow self...' : étendre la durée de vie via transmute sûr ici
+   729→   729→            let mut pass = pass.forget_lifetime();
+   730→   730→            self.draw_instances_pass(&mut pass, statics, dynamics);
+   731→   731→        }
+   732→   732→
+   733→   733→        // 2) Post-process -> surface.
+   734→   734→        {
+   735→   735→            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+   736→   736→                label: Some("post-pass"),
+   737→   737→                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+   738→   738→                    view: &frame_view,
+   739→   739→                    resolve_target: None,
+   740→   740→                    ops: wgpu::Operations {
+   741→   741→                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+   742→   742→                        store: wgpu::StoreOp::Store,
+   743→   743→                    },
+   744→   744→                })],
+   745→   745→                depth_stencil_attachment: None,
+   746→   746→                timestamp_writes: None,
+   747→   747→                occlusion_query_set: None,
+   748→   748→            });
+   749→   749→            pass.set_pipeline(&self.post_pipeline);
+   750→   750→            pass.set_bind_group(0, &self.post_bind, &[]);
+   751→   751→            pass.draw(0..3, 0..1);
+   752→   752→        }
+   753→   753→
+   754→   754→        // 3) UI -> surface.
+   755→   755→        if !verts.is_empty() {
+   756→   756→            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+   757→   757→                label: Some("ui-pass"),
+   758→   758→                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+   759→   759→                    view: &frame_view,
+   760→   760→                    resolve_target: None,
+   761→   761→                    ops: wgpu::Operations {
+   762→   762→                        load: wgpu::LoadOp::Load,
+   763→   763→                        store: wgpu::StoreOp::Store,
+   764→   764→                    },
+   765→   765→                })],
+   766→   766→                depth_stencil_attachment: None,
+   767→   767→                timestamp_writes: None,
+   768→   768→                occlusion_query_set: None,
+   769→   769→            });
+   770→   770→            pass.set_pipeline(&self.ui_pipeline);
+   771→   771→            pass.set_bind_group(0, &self.ui_bind0, &[]);
+   772→   772→            let stride = std::mem::size_of::<ui::UiVertex>() as u64;
+   773→   773→            let mut cursor = 0u64;
+   774→   774→            for (_op, (is_text, quads)) in ui_ops.iter().zip(draws.iter()) {
+   775→   775→                if *quads == 0 {
+   776→   776→                    continue;
+   777→   777→                }
+   778→   778→                match is_text {
+   779→   779→                    true => pass.set_bind_group(1, &self.font_bg, &[]),
+   780→   780→                    false => pass.set_bind_group(1, &self.white_bg, &[]),
+   781→   781→                }
+   782→   782→                let bytes = *quads as u64 * 4 * stride;
+   783→   783→                pass.set_vertex_buffer(0, self.ui_buf.slice(cursor..cursor + bytes));
+   784→   784→                pass.draw(0..4, 0..*quads);
+   785→   785→                cursor += bytes;
+   786→   786→            }
+   787→   787→        }
+   788→   788→
+   789→   789→        self.queue.submit(Some(encoder.finish()));
+   790→   790→        frame.present();
+   791→   791→        Ok(())
+   792→   792→    }
+   793→   793→}
+   794→   794→

@@ -83,6 +83,7 @@ pub const CONTROLS: usize = 56;
 pub const HOST_OF: usize = 57;
 pub const WAITING: usize = 58;
 pub const STAMINA: usize = 59;
+pub const OPT_RENDER: usize = 60;
 
 pub fn t(lang: Lang, key: usize) -> &'static str {
     let (fr, en) = TEXTS[key];
@@ -233,4 +234,6 @@ pub const TEXTS: &[(&str, &str)] = &[
     ("…", "…"),
     // 59
     ("Endurance", "Stamina"),
+    // 60
+    ("Échelle de rendu [R]", "Render scale [R]"),
 ];

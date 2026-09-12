@@ -82,6 +82,21 @@ Test rapide sans GUI : `./target/release/sl3-server --bots 2` démarre une room 
 | `Échap` | Pause / retour |
 | `F1` | Basculer **FR ⇄ EN** |
 
+## 🖥️ Performances (vieux PC / iGPU)
+
+Le client intègre une **résolution dynamique** : le monde est rendu dans un buffer
+à échelle réduite puis l'upscale passe par le post-process (UI toujours nette en
+pleine résolution). Par défaut en mode **auto** — l'échelle s'ajuste toutes les
+0,75 s pour viser ~60 fps (plancher 45 %). La ligne en haut à droite affiche
+`FPS · rendu XX%`.
+
+Dans **Options**, `R` cycle le mode : `auto → 100 % → 85 % → 70 % → 55 % → auto`
+(choix mémorisé dans `sl3_config.json`). Côté assets : mipmaps générés à la main
+(filtre box en espace linéaire) + filtrage anisotrope ×8, textures des grandes
+surfaces sans couture en 512 px — peu d'aliasing, moins de bande passante.
+Un i7 de 7e génération (iGPU HD 630) tourne confortablement à 1080p en laissant
+l'auto à 60-75 %.
+
 ## 🧪 Tests
 
 ```bash
@@ -91,6 +106,7 @@ cargo test
 - Tests unitaires **shared** : carte ASCII (connectivité BFS de tous les objectifs, longueur des lignes), roundtrip du protocole.
 - Tests unitaires **server** : reboot complet d'un serveur, validation de la note de frais → ouverture de la sortie → évasion → fin de partie, audition de l'entité.
 - Test d'intégration **lobby** : lance le vrai binaire serveur et joue toute la séquence en TCP (Hello → CreateRoom → mauvais mot de passe → JoinRoom → StartGame → GameStarted → snapshots → LeaveRoom).
+- Test **assets** (client) : chaque GLTF charge via le même parseur que le jeu, matériaux connus du moteur, indices dans les bornes, budget de triangles respecté.
 
 ## 🏗️ Architecture
 
@@ -107,6 +123,8 @@ support-level-3/
 │   └── client/     Moteur wgpu 22 + winit 0.30 :
 │                   • pipeline monde (instances, néons, lampe torche spot, brouillard)
 │                   • post-process « vision de panique » (distorsion, grain, vignette)
+│                   • résolution dynamique (offscreen ×échelle, upscale post, UI 1:1)
+│                   • mipmaps CPU (espace linéaire) + anisotropie ×8
 │                   • UI bitmap bilingue (atlas de police généré)
 │                   • chargement GLTF (géométrie/normales/UV) + textures PNG
 │                   • audio rodio (ambiance, cœur, murmures, SFX spatialisés en gain)

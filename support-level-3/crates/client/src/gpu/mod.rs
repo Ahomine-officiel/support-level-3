@@ -130,6 +130,8 @@ pub struct Renderer {
     offscreen_tex: wgpu::Texture,
     depth_view: wgpu::TextureView,
     depth_tex: wgpu::Texture,
+    /// Échelle de rendu dynamique (1.0 = pleine résolution, 0.45 min) — iGPU friendly.
+    render_scale: f32,
 
     ui_pipeline: wgpu::RenderPipeline,
     ui_bind0: wgpu::BindGroup,
@@ -272,7 +274,6 @@ impl Renderer {
 
         let (offscreen_tex, offscreen_view) = Self::make_offscreen(&device, size.width.max(1), size.height.max(1), format);
         let (depth_tex, depth_view) = Self::make_depth(&device, size.width.max(1), size.height.max(1));
-
         let post_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("post-bind"),
             layout: &post_layout,
@@ -359,6 +360,7 @@ impl Renderer {
             offscreen_tex,
             depth_view,
             depth_tex,
+            render_scale: 1.0,
             ui_pipeline,
             ui_bind0,
             ui_uniform_buf,
@@ -549,9 +551,27 @@ impl Renderer {
         self.surface_config.width = w;
         self.surface_config.height = h;
         self.surface.configure(&self.device, &self.surface_config);
-        let (t, v) = Self::make_offscreen(&self.device, w, h, self.surface_config.format);
+        let (sw, sh) = self.scaled_size();
+        let (t, v) = Self::make_offscreen(&self.device, sw, sh, self.surface_config.format);
         self.offscreen_tex = t;
         self.offscreen_view = v;
+        self.rebuild_post_bind();
+        let (dt, dv) = Self::make_depth(&self.device, sw, sh);
+        self.depth_tex = dt;
+        self.depth_view = dv;
+        let ui_data = [w as f32, h as f32, 0.0, 0.0];
+        self.queue.write_buffer(&self.ui_uniform_buf, 0, bytemuck::cast_slice(&ui_data));
+    }
+
+    /// Taille du buffer monde = surface × échelle de rendu.
+    fn scaled_size(&self) -> (u32, u32) {
+        (
+            ((self.surface_config.width as f32 * self.render_scale) as u32).max(1),
+            ((self.surface_config.height as f32 * self.render_scale) as u32).max(1),
+        )
+    }
+
+    fn rebuild_post_bind(&mut self) {
         let post_layout = self.post_pipeline.get_bind_group_layout(0);
         self.post_bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("post-bind"),
@@ -562,11 +582,27 @@ impl Renderer {
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&self.offscreen_view) },
             ],
         });
-        let (dt, dv) = Self::make_depth(&self.device, w, h);
+    }
+
+    /// Change l'échelle de rendu (recrée offscreen + depth, post/UI restent en pleine résolution).
+    pub fn set_render_scale(&mut self, scale: f32) {
+        let s = scale.clamp(0.45, 1.0);
+        if (s - self.render_scale).abs() < 0.001 {
+            return;
+        }
+        self.render_scale = s;
+        let (sw, sh) = self.scaled_size();
+        let (t, v) = Self::make_offscreen(&self.device, sw, sh, self.surface_config.format);
+        self.offscreen_tex = t;
+        self.offscreen_view = v;
+        self.rebuild_post_bind();
+        let (dt, dv) = Self::make_depth(&self.device, sw, sh);
         self.depth_tex = dt;
         self.depth_view = dv;
-        let ui_data = [w as f32, h as f32, 0.0, 0.0];
-        self.queue.write_buffer(&self.ui_uniform_buf, 0, bytemuck::cast_slice(&ui_data));
+    }
+
+    pub fn render_scale(&self) -> f32 {
+        self.render_scale
     }
 
     // ---------- construction des batchs statiques ----------

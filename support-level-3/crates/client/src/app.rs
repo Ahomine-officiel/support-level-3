@@ -65,6 +65,9 @@ pub struct App {
     paused: bool,
     last_frame: Instant,
     err: Option<(Instant, String)>,
+    /// Moyenne glissante du temps de frame (pour la résolution dynamique).
+    ema_frame: f32,
+    last_scale_adj: Instant,
     audio: Option<Audio>,
     map: Option<&'static MapData>,
     players: Vec<LobbyPlayer>,
@@ -89,6 +92,8 @@ impl App {
             paused: false,
             last_frame: Instant::now(),
             err: None,
+            ema_frame: 1.0 / 60.0,
+            last_scale_adj: Instant::now(),
             audio,
             map: None,
             players: Vec::new(),
@@ -480,6 +485,26 @@ impl App {
                         buf: self.config.name.clone(),
                     });
                 }
+                KeyCode::KeyR => {
+                    // Cycle : auto -> 100 % -> 85 % -> 70 % -> 55 % -> auto.
+                    self.config.render_scale = if self.config.render_scale <= 0.0 {
+                        1.0
+                    } else if (self.config.render_scale - 1.0).abs() < 1e-3 {
+                        0.85
+                    } else if (self.config.render_scale - 0.85).abs() < 1e-3 {
+                        0.7
+                    } else if (self.config.render_scale - 0.7).abs() < 1e-3 {
+                        0.55
+                    } else {
+                        0.0
+                    };
+                    self.config.save();
+                    if self.config.render_scale > 0.0 {
+                        if let Some(r) = self.renderer.as_mut() {
+                            r.set_render_scale(self.config.render_scale);
+                        }
+                    }
+                }
                 KeyCode::ArrowLeft => {
                     self.config.sensitivity = (self.config.sensitivity - 0.1).max(0.2);
                     self.config.save();
@@ -502,6 +527,26 @@ impl App {
         self.handle_net_events();
         let dt = self.last_frame.elapsed().as_secs_f32().min(0.1);
         self.last_frame = Instant::now();
+
+        // Résolution dynamique : adapte l'échelle de rendu au temps de frame réel
+        // (cible ~60 fps ; plafond 1.0, plancher 0.45) — pensé pour iGPU / vieilles machines.
+        self.ema_frame = self.ema_frame * 0.92 + dt * 0.08;
+        if let Some(r) = self.renderer.as_mut() {
+            if self.config.render_scale <= 0.0 {
+                if self.last_scale_adj.elapsed().as_secs_f32() > 0.75 {
+                    let cur = r.render_scale();
+                    if self.ema_frame > 0.021 && cur > 0.45 {
+                        r.set_render_scale(cur - 0.05);
+                        self.last_scale_adj = Instant::now();
+                    } else if self.ema_frame < 0.0145 && cur < 1.0 {
+                        r.set_render_scale(cur + 0.05);
+                        self.last_scale_adj = Instant::now();
+                    }
+                }
+            } else {
+                r.set_render_scale(self.config.render_scale);
+            }
+        }
         let (w, h) = {
             let s = self.renderer.as_ref().unwrap().size();
             (s.0 as f32, s.1 as f32)
@@ -554,6 +599,12 @@ impl App {
                 if let Some(g) = self.game.as_ref() {
                     hud::draw(&mut ui_ops, g, &font, self.lang, (w, h));
                 }
+                // Ligne perf (haut-droite) : FPS + échelle de rendu effective.
+                let fps = (1.0 / self.ema_frame.max(1e-4)) as u32;
+                let pct = (self.renderer.as_ref().unwrap().render_scale() * 100.0).round() as u32;
+                let perf = format!("{fps} FPS · rendu {pct}%");
+                let tw = crate::gpu::ui::text_width(&font, &perf, 13.0);
+                ui_ops.push(UiOp::text(w - tw - 12.0, 10.0, 13.0, [0.62, 0.68, 0.62, 0.75], &perf));
                 if self.paused {
                     draw_center(&mut ui_ops, &font, t(self.lang, PAUSED), 34.0, WHITE_C, (w, h * 0.42));
                     draw_center(&mut ui_ops, &font, t(self.lang, RESUME_HINT), 18.0, DIM_C, (w, h * 0.42 + 50.0));
@@ -670,6 +721,24 @@ impl App {
                     20.0,
                     WHITE_C,
                     (w, h * 0.4 + 80.0),
+                );
+                let rs_label = if self.config.render_scale <= 0.0 {
+                    let cur = self
+                        .renderer
+                        .as_ref()
+                        .map(|r| r.render_scale())
+                        .unwrap_or(1.0);
+                    format!("auto ({:.0}%)", cur * 100.0)
+                } else {
+                    format!("{:.0}%", self.config.render_scale * 100.0)
+                };
+                draw_center(
+                    ui,
+                    &font,
+                    &format!("{} : {}", t(self.lang, OPT_RENDER), rs_label),
+                    20.0,
+                    WHITE_C,
+                    (w, h * 0.4 + 120.0),
                 );
                 draw_center(ui, &font, t(self.lang, BACK_HINT), 16.0, DIM_C, (w, h * 0.75));
             }

@@ -9,6 +9,8 @@ pub struct Config {
     pub host_default: String,   // addr:port par défaut
     pub sensitivity: f32,
     pub volume: f32,
+    #[serde(default)]
+    pub render_scale: f32,      // 0.0 = auto (DRS), sinon 0.45..1.0
 }
 
 impl Default for Config {
@@ -19,6 +21,7 @@ impl Default for Config {
             host_default: "127.0.0.1:27070".into(),
             sensitivity: 1.0,
             volume: 0.8,
+            render_scale: 0.0,
         }
     }
 }
