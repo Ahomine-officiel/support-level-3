@@ -1,0 +1,164 @@
+{
+ "asset": {
+  "version": "2.0",
+  "generator": "sl3-tools"
+ },
+ "scene": 0,
+ "scenes": [
+  {
+   "nodes": [
+    0
+   ]
+  }
+ ],
+ "nodes": [
+  {
+   "mesh": 0,
+   "name": "cable_tray"
+  }
+ ],
+ "meshes": [
+  {
+   "primitives": [
+    {
+     "attributes": {
+      "POSITION": 0,
+      "NORMAL": 1,
+      "TEXCOORD_0": 2
+     },
+     "indices": 4,
+     "material": 0
+    },
+    {
+     "attributes": {
+      "POSITION": 0,
+      "NORMAL": 1,
+      "TEXCOORD_0": 2
+     },
+     "indices": 5,
+     "material": 0
+    },
+    {
+     "attributes": {
+      "POSITION": 0,
+      "NORMAL": 1,
+      "TEXCOORD_0": 2
+     },
+     "indices": 6,
+     "material": 0
+    },
+    {
+     "attributes": {
+      "POSITION": 0,
+      "NORMAL": 1,
+      "TEXCOORD_0": 2
+     },
+     "indices": 7,
+     "material": 0
+    }
+   ],
+   "name": "cable_tray"
+  }
+ ],
+ "materials": [
+  {
+   "name": "metal_dark"
+  }
+ ],
+ "accessors": [
+  {
+   "bufferView": 0,
+   "componentType": 5126,
+   "count": 138,
+   "type": "VEC3",
+   "min": [
+    -1.0,
+    -0.09,
+    -0.14
+   ],
+   "max": [
+    1.0,
+    1.91,
+    0.14
+   ]
+  },
+  {
+   "bufferView": 1,
+   "componentType": 5126,
+   "count": 138,
+   "type": "VEC3"
+  },
+  {
+   "bufferView": 2,
+   "componentType": 5126,
+   "count": 138,
+   "type": "VEC2"
+  },
+  {
+   "bufferView": 3,
+   "componentType": 5125,
+   "count": 252,
+   "type": "SCALAR"
+  },
+  {
+   "bufferView": 3,
+   "byteOffset": 0,
+   "componentType": 5125,
+   "count": 36,
+   "type": "SCALAR"
+  },
+  {
+   "bufferView": 3,
+   "byteOffset": 144,
+   "componentType": 5125,
+   "count": 72,
+   "type": "SCALAR"
+  },
+  {
+   "bufferView": 3,
+   "byteOffset": 432,
+   "componentType": 5125,
+   "count": 72,
+   "type": "SCALAR"
+  },
+  {
+   "bufferView": 3,
+   "byteOffset": 720,
+   "componentType": 5125,
+   "count": 72,
+   "type": "SCALAR"
+  }
+ ],
+ "bufferViews": [
+  {
+   "buffer": 0,
+   "byteOffset": 0,
+   "byteLength": 1656,
+   "target": 34962
+  },
+  {
+   "buffer": 0,
+   "byteOffset": 1656,
+   "byteLength": 1656,
+   "target": 34962
+  },
+  {
+   "buffer": 0,
+   "byteOffset": 3312,
+   "byteLength": 1104,
+   "target": 34962
+  },
+  {
+   "buffer": 0,
+   "byteOffset": 4416,
+   "byteLength": 1008,
+   "target": 34963
+  }
+ ],
+ "buffers": [
+  {
+   "uri": "cable_tray.bin",
+   "byteLength": 5424
+  }
+ ]
+}

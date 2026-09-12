@@ -1,0 +1,135 @@
+{
+ "asset": {
+  "version": "2.0",
+  "generator": "sl3-tools"
+ },
+ "scene": 0,
+ "scenes": [
+  {
+   "nodes": [
+    0
+   ]
+  }
+ ],
+ "nodes": [
+  {
+   "mesh": 0,
+   "name": "extinguisher"
+  }
+ ],
+ "meshes": [
+  {
+   "primitives": [
+    {
+     "attributes": {
+      "POSITION": 0,
+      "NORMAL": 1,
+      "TEXCOORD_0": 2
+     },
+     "indices": 4,
+     "material": 0
+    },
+    {
+     "attributes": {
+      "POSITION": 0,
+      "NORMAL": 1,
+      "TEXCOORD_0": 2
+     },
+     "indices": 5,
+     "material": 1
+    }
+   ],
+   "name": "extinguisher"
+  }
+ ],
+ "materials": [
+  {
+   "name": "extinguisher"
+  },
+  {
+   "name": "metal_dark"
+  }
+ ],
+ "accessors": [
+  {
+   "bufferView": 0,
+   "componentType": 5126,
+   "count": 98,
+   "type": "VEC3",
+   "min": [
+    -0.09,
+    0,
+    -0.09
+   ],
+   "max": [
+    0.09,
+    0.535,
+    0.09
+   ]
+  },
+  {
+   "bufferView": 1,
+   "componentType": 5126,
+   "count": 98,
+   "type": "VEC3"
+  },
+  {
+   "bufferView": 2,
+   "componentType": 5126,
+   "count": 98,
+   "type": "VEC2"
+  },
+  {
+   "bufferView": 3,
+   "componentType": 5125,
+   "count": 180,
+   "type": "SCALAR"
+  },
+  {
+   "bufferView": 3,
+   "byteOffset": 0,
+   "componentType": 5125,
+   "count": 144,
+   "type": "SCALAR"
+  },
+  {
+   "bufferView": 3,
+   "byteOffset": 576,
+   "componentType": 5125,
+   "count": 36,
+   "type": "SCALAR"
+  }
+ ],
+ "bufferViews": [
+  {
+   "buffer": 0,
+   "byteOffset": 0,
+   "byteLength": 1176,
+   "target": 34962
+  },
+  {
+   "buffer": 0,
+   "byteOffset": 1176,
+   "byteLength": 1176,
+   "target": 34962
+  },
+  {
+   "buffer": 0,
+   "byteOffset": 2352,
+   "byteLength": 784,
+   "target": 34962
+  },
+  {
+   "buffer": 0,
+   "byteOffset": 3136,
+   "byteLength": 720,
+   "target": 34963
+  }
+ ],
+ "buffers": [
+  {
+   "uri": "extinguisher.bin",
+   "byteLength": 3856
+  }
+ ]
+}

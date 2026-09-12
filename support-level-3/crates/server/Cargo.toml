@@ -1,0 +1,11 @@
+[package]
+name = "sl3-server"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+sl3-shared = { path = "../shared" }
+serde = { workspace = true }
+bincode = { workspace = true }
+glam = { workspace = true }
+rand = "0.8"

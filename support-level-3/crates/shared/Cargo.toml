@@ -1,0 +1,9 @@
+[package]
+name = "sl3-shared"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+bincode = { workspace = true }
+glam = { workspace = true }
