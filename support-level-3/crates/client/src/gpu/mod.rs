@@ -128,6 +128,23 @@ pub struct RtFrame<'a> {
     pub dyn_boxes: &'a [rtscene::GpuAabb],
 }
 
+/// Données par frame pour l'upscaling temporel (None = chemin natif).
+pub struct UpsFrame {
+    /// inverse(proj * vue) de la frame courante (jitterée), pour les vecteurs de mouvement.
+    pub inv_vp: [[f32; 4]; 4],
+}
+
+/// Uniform des passes d'upscaling (miroir de shaders/upscale.wgsl).
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct UpsParams {
+    pub display_size: [f32; 4],
+    pub render_size: [f32; 4],
+    pub jitter: [f32; 4],
+    pub inv_vp_cur: [[f32; 4]; 4],
+    pub vp_prev: [[f32; 4]; 4],
+}
+
 pub struct StaticBatches {
     pub batches: Vec<StaticBatch>,
     pub total_instances: usize,
@@ -155,6 +172,44 @@ pub struct Renderer {
     depth_tex: wgpu::Texture,
     /// Échelle de rendu dynamique (1.0 = pleine résolution, 0.45 min) — iGPU friendly.
     render_scale: f32,
+
+    // ----- Upscaling temporel (FSR 3 / DLSS) -----
+    /// 0 = natif, 1 = FSR 3 (upscaling temporel), 2 = DLSS (même noyau, RTX requis).
+    pub upscaler: u8,
+    /// 0 = qualité (x1.5), 1 = équilibré (x1.7), 2 = performance (x2.0).
+    upscale_quality: u8,
+    /// Multiplicateur interne du preset (1.0 en natif).
+    ups_scale: f32,
+    /// Netteté RCAS (stops ; grand = plus doux).
+    rcas_stops: f32,
+    mv_pipeline: wgpu::RenderPipeline,
+    dilate_pipeline: wgpu::RenderPipeline,
+    accum_pipeline: wgpu::RenderPipeline,
+    rcas_pipeline: wgpu::RenderPipeline,
+    mv_bind_layout: wgpu::BindGroupLayout,
+    dilate_bind_layout: wgpu::BindGroupLayout,
+    accum_bind_layout: wgpu::BindGroupLayout,
+    rcas_bind_layout: wgpu::BindGroupLayout,
+    mv_bind: wgpu::BindGroup,
+    dilate_bind: wgpu::BindGroup,
+    accum_bind: wgpu::BindGroup,
+    rcas_bind: wgpu::BindGroup,
+    ups_uniform_buf: wgpu::Buffer,
+    post_tex: wgpu::Texture,
+    post_view: wgpu::TextureView,
+    mv_tex: wgpu::Texture,
+    mv_view: wgpu::TextureView,
+    mv_dil_tex: wgpu::Texture,
+    mv_dil_view: wgpu::TextureView,
+    hist_texs: [wgpu::Texture; 2],
+    hist_views: [wgpu::TextureView; 2],
+    hist_idx: usize,
+    prev_vp: Option<[[f32; 4]; 4]>,
+    frame_idx: u32,
+    /// Jitter courant en pixels internes (x, -y) pour l'uniform shader.
+    jitter_px: [f32; 2],
+    /// Historique temporel à invalider (changement de taille/mode/qualité/début de partie).
+    pub reset_upscale: bool,
 
     ui_pipeline: wgpu::RenderPipeline,
     ui_bind0: wgpu::BindGroup,
@@ -471,7 +526,111 @@ impl Renderer {
             usage: wgpu::BufferUsages::INDEX,
         });
 
-        Renderer {
+        // ----- Upscaling temporel (FSR 3 / DLSS) : pipelines + layouts -----
+        let ups_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("upscale.wgsl"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/upscale.wgsl").into()),
+        });
+        let uni_entry = || wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+            count: None,
+        };
+        let depth_entry = || wgpu::BindGroupLayoutEntry {
+            binding: 1,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Depth, multisampled: false, view_dimension: wgpu::TextureViewDimension::D2 },
+            count: None,
+        };
+        let ftexture = |binding: u32| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, multisampled: false, view_dimension: wgpu::TextureViewDimension::D2 },
+            count: None,
+        };
+        let mv_bind_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("ups-mv-layout"),
+            entries: &[uni_entry(), depth_entry()],
+        });
+        let dilate_bind_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("ups-dilate-layout"),
+            entries: &[uni_entry(), depth_entry(), ftexture(4)],
+        });
+        let accum_bind_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("ups-accum-layout"),
+            entries: &[
+                uni_entry(),
+                wgpu::BindGroupLayoutEntry { binding: 2, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
+                ftexture(3),
+                ftexture(5),
+                ftexture(6),
+            ],
+        });
+        let rcas_bind_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("ups-rcas-layout"),
+            entries: &[uni_entry(), ftexture(6)],
+        });
+        let mv_pipeline = Self::ups_pipeline(&device, &mv_bind_layout, &ups_shader, "fs_mv", wgpu::TextureFormat::Rg16Float);
+        let dilate_pipeline = Self::ups_pipeline(&device, &dilate_bind_layout, &ups_shader, "fs_dilate", wgpu::TextureFormat::Rg16Float);
+        let accum_pipeline = Self::ups_pipeline(&device, &accum_bind_layout, &ups_shader, "fs_accum", wgpu::TextureFormat::Rgba16Float);
+        let rcas_pipeline = Self::ups_pipeline(&device, &rcas_bind_layout, &ups_shader, "fs_rcas", format);
+        let ups_uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ups-uniform"),
+            size: std::mem::size_of::<UpsParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        // Textures provisoires 1x1 : recreate_all_targets() les dimensionne juste après.
+        let mk1 = |label: &str, fmt: wgpu::TextureFormat| -> (wgpu::Texture, wgpu::TextureView) {
+            let t = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: fmt,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            let v = t.create_view(&wgpu::TextureViewDescriptor::default());
+            (t, v)
+        };
+        let (post_tex, post_view) = mk1("ups-post", format);
+        let (mv_tex, mv_view) = mk1("ups-mv", wgpu::TextureFormat::Rg16Float);
+        let (mv_dil_tex, mv_dil_view) = mk1("ups-mv-dil", wgpu::TextureFormat::Rg16Float);
+        let (h0, h0v) = mk1("ups-hist0", wgpu::TextureFormat::Rgba16Float);
+        let (h1, h1v) = mk1("ups-hist1", wgpu::TextureFormat::Rgba16Float);
+        let mk_bind = |layout: &wgpu::BindGroupLayout, entries: &[wgpu::BindGroupEntry]| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("ups-bind"),
+                layout,
+                entries,
+            })
+        };
+        let uni_res = ups_uniform_buf.as_entire_binding();
+        let mv_bind = mk_bind(&mv_bind_layout, &[
+            wgpu::BindGroupEntry { binding: 0, resource: uni_res.clone() },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&depth_view) },
+        ]);
+        let dilate_bind = mk_bind(&dilate_bind_layout, &[
+            wgpu::BindGroupEntry { binding: 0, resource: uni_res.clone() },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&depth_view) },
+            wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&mv_view) },
+        ]);
+        let accum_bind = mk_bind(&accum_bind_layout, &[
+            wgpu::BindGroupEntry { binding: 0, resource: uni_res.clone() },
+            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&texture::linear_sampler(&device, false)) },
+            wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&post_view) },
+            wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&mv_dil_view) },
+            wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(&h0v) },
+        ]);
+        let rcas_bind = mk_bind(&rcas_bind_layout, &[
+            wgpu::BindGroupEntry { binding: 0, resource: uni_res.clone() },
+            wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(&h0v) },
+        ]);
+
+        let renderer_struct = Renderer {
             device,
             queue,
             surface,
@@ -490,6 +649,36 @@ impl Renderer {
             depth_view,
             depth_tex,
             render_scale: 1.0,
+            upscaler: 0,
+            upscale_quality: 0,
+            ups_scale: 1.0,
+            rcas_stops: 2.0,
+            mv_pipeline,
+            dilate_pipeline,
+            accum_pipeline,
+            rcas_pipeline,
+            mv_bind_layout,
+            dilate_bind_layout,
+            accum_bind_layout,
+            rcas_bind_layout,
+            mv_bind,
+            dilate_bind,
+            accum_bind,
+            rcas_bind,
+            ups_uniform_buf,
+            post_tex,
+            post_view,
+            mv_tex,
+            mv_view,
+            mv_dil_tex,
+            mv_dil_view,
+            hist_texs: [h0, h1],
+            hist_views: [h0v, h1v],
+            hist_idx: 0,
+            prev_vp: None,
+            frame_idx: 0,
+            jitter_px: [0.0, 0.0],
+            reset_upscale: true,
             ui_pipeline,
             ui_bind0,
             ui_uniform_buf,
@@ -521,7 +710,10 @@ impl Renderer {
             rt_neutral0,
             rt_neutral1,
             adapter_name,
-        }
+        };
+        let mut renderer = renderer_struct;
+        renderer.recreate_all_targets();
+        renderer
     }
 
     // ---------- helpers de création ----------
@@ -820,6 +1012,14 @@ impl Renderer {
         self.surface_config.width = w;
         self.surface_config.height = h;
         self.surface.configure(&self.device, &self.surface_config);
+        self.recreate_all_targets();
+        let ui_data = [w as f32, h as f32, 0.0, 0.0];
+        self.queue.write_buffer(&self.ui_uniform_buf, 0, bytemuck::cast_slice(&ui_data));
+    }
+
+    /// Recrée toutes les cibles dépendant de la taille interne (offscreen, depth,
+    /// post, mv, historique) + rebranche les bind groups + invalide l'historique.
+    fn recreate_all_targets(&mut self) {
         let (sw, sh) = self.scaled_size();
         let (t, v) = Self::make_offscreen(&self.device, sw, sh, self.surface_config.format);
         self.offscreen_tex = t;
@@ -830,15 +1030,16 @@ impl Renderer {
         self.depth_view = dv;
         self.rebuild_rt_bind();
         self.recreate_rt_targets();
-        let ui_data = [w as f32, h as f32, 0.0, 0.0];
-        self.queue.write_buffer(&self.ui_uniform_buf, 0, bytemuck::cast_slice(&ui_data));
+        self.recreate_ups_targets();
+        self.reset_upscale = true;
     }
 
-    /// Taille du buffer monde = surface × échelle de rendu.
+    /// Taille du buffer monde = surface × échelle de rendu × preset upscaling.
     fn scaled_size(&self) -> (u32, u32) {
+        let k = self.render_scale * self.ups_scale;
         (
-            ((self.surface_config.width as f32 * self.render_scale) as u32).max(1),
-            ((self.surface_config.height as f32 * self.render_scale) as u32).max(1),
+            ((self.surface_config.width as f32 * k) as u32).max(1),
+            ((self.surface_config.height as f32 * k) as u32).max(1),
         )
     }
 
@@ -862,16 +1063,184 @@ impl Renderer {
             return;
         }
         self.render_scale = s;
+        self.recreate_all_targets();
+    }
+
+    // ---------- upscaling temporel (FSR 3 / DLSS) ----------
+
+    /// Échelle interne des presets : qualité x1.5, équilibré x1.7, performance x2.0.
+    fn ups_preset_scale(quality: u8) -> f32 {
+        match quality.min(2) {
+            0 => 1.0 / 1.5,
+            1 => 1.0 / 1.7,
+            _ => 0.5,
+        }
+    }
+
+    /// Change d'upscaler et de preset qualité, recrée les cibles et invalide l'historique.
+    pub fn set_upscaler(&mut self, mode: u8, quality: u8) {
+        let mode = mode.min(2);
+        let quality = quality.min(2);
+        if mode == self.upscaler && quality == self.upscale_quality {
+            return;
+        }
+        self.upscaler = mode;
+        self.upscale_quality = quality;
+        self.ups_scale = if mode == 0 { 1.0 } else { Self::ups_preset_scale(quality) };
+        self.rcas_stops = match quality.min(2) {
+            0 => 1.5,
+            1 => 2.0,
+            _ => 2.5,
+        };
+        self.recreate_all_targets();
+    }
+
+    pub fn ups_active(&self) -> bool {
+        self.upscaler > 0
+    }
+
+    /// Taille interne de rendu (pour l'application du jitter NDC côté jeu).
+    pub fn internal_size(&self) -> (u32, u32) {
+        self.scaled_size()
+    }
+
+    /// Jitter Halton(2,3) 8 phases, en pixels internes (amplitude ±0.5 px).
+    /// Retourne (jx, jy) ; met à jour la copie shader (jx, -jy).
+    pub fn jitter_xy(&mut self) -> (f32, f32) {
+        if self.upscaler == 0 {
+            self.jitter_px = [0.0, 0.0];
+            return (0.0, 0.0);
+        }
+        let phase = (self.frame_idx % 8) + 1;
+        let jx = Self::halton(phase, 2) - 0.5;
+        let jy = Self::halton(phase, 3) - 0.5;
+        self.jitter_px = [jx, -jy];
+        (jx, jy)
+    }
+
+    fn halton(mut i: u32, base: u32) -> f32 {
+        let mut f = 1.0f32;
+        let mut r = 0.0f32;
+        while i > 0 {
+            f /= base as f32;
+            r += f * (i % base) as f32;
+            i /= base;
+        }
+        r
+    }
+
+    /// (Re)crée les cibles de l'upscaling temporel et rebranche les bind groups.
+    fn recreate_ups_targets(&mut self) {
         let (sw, sh) = self.scaled_size();
-        let (t, v) = Self::make_offscreen(&self.device, sw, sh, self.surface_config.format);
-        self.offscreen_tex = t;
-        self.offscreen_view = v;
-        self.rebuild_post_bind();
-        let (dt, dv) = Self::make_depth(&self.device, sw, sh);
-        self.depth_tex = dt;
-        self.depth_view = dv;
-        self.rebuild_rt_bind();
-        self.recreate_rt_targets();
+        let (w, h) = (self.surface_config.width, self.surface_config.height);
+        let fmt = self.surface_config.format;
+        let (t, v) = Self::make_ups_tex(&self.device, sw, sh, fmt, "ups-post");
+        self.post_tex = t;
+        self.post_view = v;
+        let (t, v) = Self::make_ups_tex(&self.device, sw, sh, wgpu::TextureFormat::Rg16Float, "ups-mv");
+        self.mv_tex = t;
+        self.mv_view = v;
+        let (t, v) = Self::make_ups_tex(&self.device, sw, sh, wgpu::TextureFormat::Rg16Float, "ups-mv-dil");
+        self.mv_dil_tex = t;
+        self.mv_dil_view = v;
+        for i in 0..2 {
+            let (t, v) = Self::make_ups_tex(&self.device, w, h, wgpu::TextureFormat::Rgba16Float, "ups-hist");
+            self.hist_texs[i] = t;
+            self.hist_views[i] = v;
+        }
+        self.hist_idx = 0;
+        self.prev_vp = None;
+        self.rebuild_ups_binds();
+    }
+
+    fn make_ups_tex(device: &wgpu::Device, w: u32, h: u32, fmt: wgpu::TextureFormat, label: &str) -> (wgpu::Texture, wgpu::TextureView) {
+        let tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size: wgpu::Extent3d { width: w.max(1), height: h.max(1), depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: fmt,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+        (tex, view)
+    }
+
+    fn rebuild_ups_binds(&mut self) {
+        let uni = self.ups_uniform_buf.as_entire_binding();
+        self.mv_bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("ups-mv-bind"),
+            layout: &self.mv_bind_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: uni.clone() },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&self.depth_view) },
+            ],
+        });
+        self.dilate_bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("ups-dilate-bind"),
+            layout: &self.dilate_bind_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: uni.clone() },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&self.depth_view) },
+                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&self.mv_view) },
+            ],
+        });
+        self.accum_bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("ups-accum-bind"),
+            layout: &self.accum_bind_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: uni.clone() },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&texture::linear_sampler(&self.device, false)) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&self.post_view) },
+                wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&self.mv_dil_view) },
+                wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(&self.hist_views[self.hist_idx]) },
+            ],
+        });
+        let out_idx = 1 - self.hist_idx;
+        self.rcas_bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("ups-rcas-bind"),
+            layout: &self.rcas_bind_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: uni },
+                wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(&self.hist_views[out_idx]) },
+            ],
+        });
+    }
+
+    /// Pipeline fullscreen (triangle) générique pour les passes d'upscaling.
+    fn ups_pipeline(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, shader: &wgpu::ShaderModule, entry: &'static str, format: wgpu::TextureFormat) -> wgpu::RenderPipeline {
+        let pll = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("ups-pll"),
+            bind_group_layouts: &[layout],
+            push_constant_ranges: &[],
+        });
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("ups-pipeline"),
+            layout: Some(&pll),
+            vertex: wgpu::VertexState {
+                module: shader,
+                entry_point: "vs",
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: shader,
+                entry_point: entry,
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState { cull_mode: None, ..Default::default() },
+            depth_stencil: None,
+            multisample: Default::default(),
+            multiview: None,
+            cache: None,
+        })
     }
 
     // ---------- ray tracing (optionnel) ----------
@@ -1069,6 +1438,7 @@ impl Renderer {
         dynamics: &[(String, Vec<InstanceData>)],
         ui_ops: &[ui::UiOp],
         post_params: [f32; 4],
+        ups: Option<UpsFrame>,
     ) -> Result<(), wgpu::SurfaceError> {
         let frame = self.surface.get_current_texture()?;
         let frame_view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -1286,12 +1656,36 @@ impl Renderer {
             self.draw_instances_pass(&mut pass, statics, &dyn_plan, &self.world_pipeline);
         }
 
-        // 2) Post-process -> surface.
+        // 2) Post-process -> cible pleine résolution (natif) ou basse résolution
+        //    (upscaling temporel : l'accumulation fera le passage à pleine résolution).
+        let ups_active = self.upscaler > 0 && ups.is_some();
+        let reset_ups = self.reset_upscale;
+        self.reset_upscale = false;
+        if ups_active {
+            // Uniform des passes d'upscaling (matrices + jitter + tailles).
+            let f = ups.as_ref().unwrap();
+            let (sw, sh) = self.scaled_size();
+            let (w, h) = (self.surface_config.width, self.surface_config.height);
+            let params = UpsParams {
+                display_size: [w as f32, h as f32, 1.0 / w as f32, 1.0 / h as f32],
+                render_size: [sw as f32, sh as f32, 1.0 / sw as f32, 1.0 / sh as f32],
+                jitter: [
+                    self.jitter_px[0],
+                    self.jitter_px[1],
+                    if reset_ups { 1.0 } else { 0.0 },
+                    self.rcas_stops,
+                ],
+                inv_vp_cur: f.inv_vp,
+                vp_prev: self.prev_vp.unwrap_or(world_uniform.view_proj),
+            };
+            self.queue.write_buffer(&self.ups_uniform_buf, 0, bytemuck::bytes_of(&params));
+        }
         {
+            let target_view = if ups_active { &self.post_view } else { &final_view };
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("post-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &final_view,
+                    view: target_view,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
@@ -1305,6 +1699,91 @@ impl Renderer {
             pass.set_pipeline(&self.post_pipeline);
             pass.set_bind_group(0, &self.post_bind, &[]);
             pass.draw(0..3, 0..1);
+        }
+
+        // 2b) FSR 3 / DLSS : vecteurs de mouvement -> dilatation -> accumulation
+        //     temporelle (Lanczos + box de rectification) -> RCAS.
+        if ups_active {
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("ups-mv"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &self.mv_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                pass.set_pipeline(&self.mv_pipeline);
+                pass.set_bind_group(0, &self.mv_bind, &[]);
+                pass.draw(0..3, 0..1);
+            }
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("ups-dilate"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &self.mv_dil_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                pass.set_pipeline(&self.dilate_pipeline);
+                pass.set_bind_group(0, &self.dilate_bind, &[]);
+                pass.draw(0..3, 0..1);
+            }
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("ups-accum"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &self.hist_views[1 - self.hist_idx],
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                pass.set_pipeline(&self.accum_pipeline);
+                pass.set_bind_group(0, &self.accum_bind, &[]);
+                pass.draw(0..3, 0..1);
+            }
+            self.hist_idx = 1 - self.hist_idx;
+            self.rebuild_ups_binds();
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("ups-rcas"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &final_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                pass.set_pipeline(&self.rcas_pipeline);
+                pass.set_bind_group(0, &self.rcas_bind, &[]);
+                pass.draw(0..3, 0..1);
+            }
+            self.frame_idx = self.frame_idx.wrapping_add(1);
+            self.prev_vp = Some(world_uniform.view_proj);
         }
 
         // 3) UI -> surface.
@@ -1396,7 +1875,7 @@ impl Renderer {
                 let start = (row * bpr) as usize;
                 rgba.extend_from_slice(&data[start..start + (w * 4) as usize]);
             }
-            if let Err(e) = image::save_buffer(path, &rgba, w, h, image::ColorType::Rgba8) {
+            if let Err(e) = image::save_buffer_with_format(path, &rgba, w, h, image::ColorType::Rgba8, image::ImageFormat::Png) {
                 eprintln!("[capture] échec {} : {e}", path.display());
             } else {
                 println!("[capture] {} ({}x{})", path.display(), w, h);

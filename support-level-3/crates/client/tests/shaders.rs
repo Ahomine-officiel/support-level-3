@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 
-const SHADERS: [&str; 4] = ["world.wgsl", "post.wgsl", "ui.wgsl", "rt.wgsl"];
+const SHADERS: [&str; 5] = ["world.wgsl", "post.wgsl", "ui.wgsl", "rt.wgsl", "upscale.wgsl"];
 
 #[test]
 fn validate_all_wgsl() {

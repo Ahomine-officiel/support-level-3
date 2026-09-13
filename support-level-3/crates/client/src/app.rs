@@ -56,6 +56,10 @@ enum AutoAct {
     Key(KeyCode),
     Shot(String),
     Yaw(f32),
+    /// Déplace le curseur (x, y en pixels fenêtre).
+    Mouse(f64, f64),
+    /// Clic gauche à (x, y) — menus à boutons.
+    Click(f64, f64),
     Exit,
 }
 
@@ -65,6 +69,8 @@ impl Clone for AutoAct {
             AutoAct::Key(k) => AutoAct::Key(*k),
             AutoAct::Shot(p) => AutoAct::Shot(p.clone()),
             AutoAct::Yaw(a) => AutoAct::Yaw(*a),
+            AutoAct::Mouse(x, y) => AutoAct::Mouse(*x, *y),
+            AutoAct::Click(x, y) => AutoAct::Click(*x, *y),
             AutoAct::Exit => AutoAct::Exit,
         }
     }
@@ -79,15 +85,16 @@ struct Auto {
 fn parse_key(name: &str) -> Option<KeyCode> {
     Some(match name {
         "Enter" | "NumpadEnter" => KeyCode::Enter,
-        "Digit1" => KeyCode::Digit1,
-        "Digit2" => KeyCode::Digit2,
-        "Digit3" => KeyCode::Digit3,
+        "Digit1" | "1" => KeyCode::Digit1,
+        "Digit2" | "2" => KeyCode::Digit2,
+        "Digit3" | "3" => KeyCode::Digit3,
         "Space" => KeyCode::Space,
         "Escape" => KeyCode::Escape,
         "Backspace" => KeyCode::Backspace,
         "F5" => KeyCode::F5,
-        "KeyF" => KeyCode::KeyF,
-        "KeyE" => KeyCode::KeyE,
+        "F6" => KeyCode::F6,
+        "KeyF" | "F" => KeyCode::KeyF,
+        "KeyE" | "E" => KeyCode::KeyE,
         _ => return None,
     })
 }
@@ -110,7 +117,18 @@ fn parse_autopilot(s: &str) -> Option<Auto> {
             "shot" => AutoAct::Shot(arg.to_string()),
             "yaw" => AutoAct::Yaw(arg.parse::<f32>().ok()?.to_radians()),
             "exit" => AutoAct::Exit,
-            _ => return None,
+            _ => {
+                // « mouse x y » et « click x y » : pilotage des boutons cliquables.
+                let mut it = head.split_whitespace();
+                let verb2 = it.next().unwrap_or("");
+                let x: f64 = it.next()?.parse().ok()?;
+                let y: f64 = it.next()?.parse().ok()?;
+                match verb2 {
+                    "mouse" => AutoAct::Mouse(x, y),
+                    "click" => AutoAct::Click(x, y),
+                    _ => return None,
+                }
+            }
         };
         steps.push(AutoStep { at, act });
     }
@@ -127,6 +145,50 @@ const DIM_C: [f32; 4] = [0.6, 0.63, 0.66, 0.85];
 const GREEN_C: [f32; 4] = [0.5, 0.95, 0.55, 1.0];
 const RED_C: [f32; 4] = [1.0, 0.4, 0.35, 1.0];
 const AMBER_C: [f32; 4] = [1.0, 0.78, 0.3, 1.0];
+
+// ----- Boutons cliquables (souris) -----
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum BtnAction {
+    Host,
+    Join,
+    OptionsMenu,
+    Quit,
+    Lang,
+    Name,
+    SensDown,
+    SensUp,
+    /// Échelle de rendu : 0 = auto, 1..4 = 100/85/70/55 %.
+    Res(u8),
+    /// 0 = natif, 1 = FSR 3, 2 = DLSS.
+    Ups(u8),
+    /// Preset qualité upscaling : 0 qualité, 1 équilibré, 2 performance.
+    UpsQ(u8),
+    /// 0 off, 1 qualité, 2 ultra.
+    Rt(u8),
+    Back,
+    StartGame,
+    LeaveLobby,
+    Resume,
+    QuitToMenu,
+    OverMenu,
+}
+
+struct HotBtn {
+    action: BtnAction,
+    /// x, y, w, h (pixels de la fenêtre).
+    rect: [f32; 4],
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum BtnState {
+    Normal,
+    Selected,
+    Disabled,
+}
+
+/// Compteur de frames (debug : SL3_DEBUG=1).
+static FRAME_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 pub struct App {
     config: Config,
@@ -152,6 +214,10 @@ pub struct App {
     fresh_config: bool,
     /// Scénario autopilot (SL3_AUTOPILOT) : capture d'écrans automatisée.
     auto: Option<Auto>,
+    /// Position du curseur (pixels fenêtre) pour les menus.
+    cursor_pos: (f32, f32),
+    /// Boutons cliquables reconstruits à chaque frame de rendu UI.
+    hot_btns: Vec<HotBtn>,
 }
 
 impl App {
@@ -163,6 +229,12 @@ impl App {
         let auto = std::env::var("SL3_AUTOPILOT")
             .ok()
             .and_then(|s| parse_autopilot(&s));
+        if std::env::var("SL3_DEBUG").is_ok() {
+            match &auto {
+                Some(a) => eprintln!("[sl3-debug] autopilot : {} steps", a.steps.len()),
+                None => eprintln!("[sl3-debug] autopilot : absent ou non parsé"),
+            }
+        }
         App {
             config,
             lang,
@@ -184,6 +256,8 @@ impl App {
             players: Vec::new(),
             fresh_config,
             auto,
+            cursor_pos: (0.0, 0.0),
+            hot_btns: Vec::new(),
         }
     }
 
@@ -198,6 +272,146 @@ impl App {
             1 => t(self.lang, RT_QUAL),
             2 => t(self.lang, RT_ULTRA),
             _ => t(self.lang, RT_OFF),
+        }
+    }
+
+    /// Cycle l'upscaler (natif -> FSR 3 -> DLSS si RTX), applique et persiste.
+    fn cycle_upscaler(&mut self) -> &'static str {
+        let rtx = self
+            .renderer
+            .as_ref()
+            .map(|r| r.adapter_name.to_uppercase().contains("RTX"))
+            .unwrap_or(false);
+        self.config.upscaler = match self.config.upscaler {
+            0 => 1,
+            1 if rtx => 2,
+            _ => 0,
+        };
+        self.apply_upscaler();
+        match self.config.upscaler {
+            1 => t(self.lang, UP_FSR3),
+            2 => t(self.lang, UP_DLSS),
+            _ => t(self.lang, UP_NATIVE),
+        }
+    }
+
+    /// Applique upscaler + preset qualité au renderer (DLSS -> FSR 3 si pas de RTX).
+    fn apply_upscaler(&mut self) {
+        let mut mode = self.config.upscaler;
+        let rtx = self
+            .renderer
+            .as_ref()
+            .map(|r| r.adapter_name.to_uppercase().contains("RTX"))
+            .unwrap_or(false);
+        if mode == 2 && !rtx {
+            mode = 1; // DLSS indisponible : repli transparent sur FSR 3
+        }
+        self.config.upscaler = mode;
+        self.config.save();
+        if let Some(r) = self.renderer.as_mut() {
+            r.set_upscaler(mode, self.config.upscale_quality);
+        }
+    }
+
+    /// Clic souris (menus) : déclenche le bouton sous le curseur, s'il existe.
+    fn on_click(&mut self) {
+        let (cx, cy) = self.cursor_pos;
+        let hit = self
+            .hot_btns
+            .iter()
+            .find(|b| cx >= b.rect[0] && cx <= b.rect[0] + b.rect[2] && cy >= b.rect[1] && cy <= b.rect[1] + b.rect[3])
+            .map(|b| b.action);
+        if std::env::var("SL3_DEBUG").is_ok() {
+            eprintln!("[sl3-debug] clic ({cx},{cy}) sur {hit:?} ({} boutons chauds)", self.hot_btns.len());
+        }
+        if let Some(action) = hit {
+            self.dispatch(action);
+        }
+    }
+
+    /// Exécute l'action d'un bouton (partagée clavier / souris).
+    fn dispatch(&mut self, action: BtnAction) {
+        match action {
+            BtnAction::Host => {
+                self.mode = Mode::MainMenu(MenuScreen::AskHostAddr {
+                    buf: self.config.host_default.clone(),
+                });
+            }
+            BtnAction::Join => {
+                self.mode = Mode::MainMenu(MenuScreen::AskJoinAddr {
+                    buf: self.config.host_default.clone(),
+                });
+            }
+            BtnAction::OptionsMenu => {
+                self.mode = Mode::MainMenu(MenuScreen::Options);
+            }
+            BtnAction::Quit => std::process::exit(0),
+            BtnAction::Lang => {
+                self.lang.toggle();
+                self.config.lang = match self.lang {
+                    Lang::Fr => "fr".into(),
+                    Lang::En => "en".into(),
+                };
+                self.config.save();
+            }
+            BtnAction::Name => {
+                self.mode = Mode::MainMenu(MenuScreen::AskName {
+                    buf: self.config.name.clone(),
+                });
+            }
+            BtnAction::SensDown => {
+                self.config.sensitivity = (self.config.sensitivity - 0.1).max(0.2);
+                self.config.save();
+            }
+            BtnAction::SensUp => {
+                self.config.sensitivity = (self.config.sensitivity + 0.1).min(3.0);
+                self.config.save();
+            }
+            BtnAction::Res(v) => {
+                self.config.render_scale = match v {
+                    0 => 0.0,
+                    1 => 1.0,
+                    2 => 0.85,
+                    3 => 0.7,
+                    _ => 0.55,
+                };
+                self.config.save();
+                if let Some(r) = self.renderer.as_mut() {
+                    if self.config.render_scale > 0.0 {
+                        r.set_render_scale(self.config.render_scale);
+                    }
+                }
+            }
+            BtnAction::Ups(v) => {
+                self.config.upscaler = v;
+                self.apply_upscaler();
+            }
+            BtnAction::UpsQ(v) => {
+                self.config.upscale_quality = v;
+                self.apply_upscaler();
+            }
+            BtnAction::Rt(v) => {
+                self.config.rt_mode = v;
+                self.config.save();
+                if let Some(r) = self.renderer.as_mut() {
+                    r.set_rt_mode(v);
+                }
+            }
+            BtnAction::Back => {
+                self.mode = Mode::MainMenu(MenuScreen::Main);
+            }
+            BtnAction::StartGame => {
+                if let Some(n) = &self.net {
+                    n.send(ClientMsg::StartGame);
+                }
+            }
+            BtnAction::LeaveLobby => self.leave_room(),
+            BtnAction::Resume => {
+                self.paused = false;
+                self.set_cursor_locked(true);
+            }
+            BtnAction::QuitToMenu => self.back_to_menu(),
+            BtnAction::OverMenu => self.leave_room(),
         }
     }
 
@@ -309,6 +523,7 @@ impl App {
                 let map: &'static MapData = Box::leak(Box::new(MapData::parse()));
                 self.map = Some(map);
                 if let Some(r) = self.renderer.as_mut() {
+                    r.reset_upscale = true;
                     let mut g = Game::new(map, your_id, spawn, r);
                     g.apply_snapshot(snapshot);
                     self.game = Some(Box::new(g));
@@ -452,6 +667,12 @@ impl App {
                     let label = self.cycle_rt_mode();
                     if let Some(g) = self.game.as_mut() {
                         g.add_feed(format!("{} : {}", t(self.lang, RT_TOAST), label));
+                    }
+                }
+                KeyCode::F6 => {
+                    let label = self.cycle_upscaler();
+                    if let Some(g) = self.game.as_mut() {
+                        g.add_feed(format!("{} : {}", t(self.lang, UP_TOAST), label));
                     }
                 }
                 _ => {}
@@ -626,6 +847,9 @@ impl App {
                 KeyCode::KeyT => {
                     let _ = self.cycle_rt_mode();
                 }
+                KeyCode::KeyU => {
+                    let _ = self.cycle_upscaler();
+                }
                 KeyCode::ArrowLeft => {
                     self.config.sensitivity = (self.config.sensitivity - 0.1).max(0.2);
                     self.config.save();
@@ -673,6 +897,8 @@ impl App {
             (s.0 as f32, s.1 as f32)
         };
         let font = self.renderer.as_ref().unwrap().font.clone();
+        // Les boutons cliquables sont reconstruits à chaque frame (UI immédiate).
+        self.hot_btns.clear();
         let mut ui_ops: Vec<UiOp> = Vec::new();
 
         let tag = match &self.mode {
@@ -707,6 +933,17 @@ impl App {
             }
             2 => {
                 let Some(tx) = self.net.as_ref().map(|n| n.tx.clone()) else { return };
+                // Jitter subpixel de l'upscaling temporel (une phase par frame rendue).
+                let ups_on = self.renderer.as_ref().unwrap().ups_active();
+                let (jx, jy, iw, ih) = if ups_on {
+                    let r = self.renderer.as_mut().unwrap();
+                    let (jx, jy) = r.jitter_xy();
+                    let (iw, ih) = r.internal_size();
+                    (jx, jy, iw as f32, ih as f32)
+                } else {
+                    (0.0, 0.0, 1.0, 1.0)
+                };
+                let jitter_ndc = [jx * 2.0 / iw, jy * 2.0 / ih];
                 let (wu, post, dyns, fear, inv_vp, rt_boxes) = {
                     let Some(g) = self.game.as_mut() else { return };
                     let local_sfx = g.update(dt, &self.keys, &tx);
@@ -716,8 +953,8 @@ impl App {
                         }
                     }
                     let dyns = g.dynamics();
-                    let wu = g.world_uniform(w / h);
-                    let inv_vp = g.inv_view_proj(w / h);
+                    let wu = g.world_uniform(w / h, jitter_ndc);
+                    let inv_vp = g.inv_view_proj(w / h, jitter_ndc);
                     let rt_boxes = match self.renderer.as_ref() {
                         Some(r) => g.rt_dynamic_boxes(&r.models),
                         None => Vec::new(),
@@ -731,17 +968,43 @@ impl App {
                 if let Some(g) = self.game.as_ref() {
                     hud::draw(&mut ui_ops, g, &font, self.lang, (w, h));
                 }
-                // Ligne perf (haut-droite) : FPS + échelle de rendu + indicateur RT.
+                // Ligne perf (haut-droite) : FPS + échelle de rendu + indicateur RT/upscaling.
                 let fps = (1.0 / self.ema_frame.max(1e-4)) as u32;
-                let pct = (self.renderer.as_ref().unwrap().render_scale() * 100.0).round() as u32;
+                let renderer = self.renderer.as_ref().unwrap();
+                let internal_pct = ((renderer.render_scale()
+                    * if renderer.ups_active() {
+                        match self.config.upscale_quality {
+                            0 => 1.0 / 1.5,
+                            1 => 1.0 / 1.7,
+                            _ => 0.5,
+                        }
+                    } else {
+                        1.0
+                    })
+                    * 100.0) as u32;
                 let rt_tag = if self.config.rt_mode > 0 { " – RT" } else { "" };
-                let perf = format!("{fps} FPS – rendu {pct}%{rt_tag}");
+                let ups_tag = if renderer.ups_active() {
+                    format!(
+                        " – {} {}",
+                        if renderer.upscaler == 2 { t(self.lang, UP_DLSS) } else { t(self.lang, UP_FSR3) },
+                        t(self.lang, match self.config.upscale_quality {
+                            0 => UP_QUALITY,
+                            1 => UP_BALANCED,
+                            _ => UP_PERF,
+                        })
+                    )
+                } else {
+                    String::new()
+                };
+                let perf = format!(
+                    "{fps} FPS – rendu {internal_pct}%{rt_tag}{ups_tag}"
+                );
                 let tw = crate::gpu::ui::text_width(&font, &perf, 13.0);
                 ui_ops.push(UiOp::text(w - tw - 12.0, 10.0, 13.0, [0.62, 0.68, 0.62, 0.75], &perf));
                 if self.paused {
                     draw_center(&mut ui_ops, &font, t(self.lang, PAUSED), 34.0, WHITE_C, (w, h * 0.42));
-                    draw_center(&mut ui_ops, &font, t(self.lang, RESUME_HINT), 18.0, DIM_C, (w, h * 0.42 + 50.0));
-                    draw_center(&mut ui_ops, &font, t(self.lang, QUIT_HINT), 18.0, DIM_C, (w, h * 0.42 + 78.0));
+                    self.button(&mut ui_ops, &font, BtnAction::Resume, w / 2.0 - 130.0, h * 0.42 + 60.0, 260.0, 40.0, t(self.lang, BTN_RESUME), BtnState::Normal);
+                    self.button(&mut ui_ops, &font, BtnAction::QuitToMenu, w / 2.0 - 130.0, h * 0.42 + 110.0, 260.0, 40.0, t(self.lang, BTN_QUITMENU), BtnState::Normal);
                 }
                 world_data = Some((wu, post, dyns, inv_vp, rt_boxes));
             }
@@ -781,7 +1044,12 @@ impl App {
                 } else {
                     None
                 };
-                let _ = renderer.render(&wu, rt, statics, &dyns, &ui_ops, post);
+                let ups = if renderer.ups_active() {
+                    Some(crate::gpu::UpsFrame { inv_vp })
+                } else {
+                    None
+                };
+                let _ = renderer.render(&wu, rt, statics, &dyns, &ui_ops, post, ups);
             }
             None => {
                 let _ = self.renderer.as_mut().unwrap().render(
@@ -791,6 +1059,7 @@ impl App {
                     &Vec::new(),
                     &ui_ops,
                     [0.0, 0.0, 0.0, 0.0],
+                    None,
                 );
             }
         }
@@ -806,10 +1075,10 @@ impl App {
 
         match screen {
             MenuScreen::Main => {
-                draw_center(ui, &font, t(self.lang, MENU_HOST), 24.0, WHITE_C, (w, h * 0.42));
-                draw_center(ui, &font, t(self.lang, MENU_JOIN), 24.0, WHITE_C, (w, h * 0.42 + 44.0));
-                draw_center(ui, &font, t(self.lang, MENU_OPTIONS), 24.0, WHITE_C, (w, h * 0.42 + 88.0));
-                draw_center(ui, &font, t(self.lang, MENU_QUIT), 17.0, DIM_C, (w, h * 0.42 + 150.0));
+                self.button(ui, &font, BtnAction::Host, w / 2.0 - 190.0, h * 0.40, 380.0, 44.0, t(self.lang, BTN_HOST), BtnState::Normal);
+                self.button(ui, &font, BtnAction::Join, w / 2.0 - 190.0, h * 0.40 + 56.0, 380.0, 44.0, t(self.lang, BTN_JOIN), BtnState::Normal);
+                self.button(ui, &font, BtnAction::OptionsMenu, w / 2.0 - 190.0, h * 0.40 + 112.0, 380.0, 44.0, t(self.lang, BTN_OPTIONS), BtnState::Normal);
+                self.button(ui, &font, BtnAction::Quit, w / 2.0 - 130.0, h * 0.40 + 180.0, 260.0, 36.0, t(self.lang, BTN_QUIT), BtnState::Normal);
             }
             MenuScreen::AskHostAddr { buf } => {
                 draw_center(ui, &font, t(self.lang, ADDR_PROMPT), 20.0, WHITE_C, (w, h * 0.45));
@@ -844,56 +1113,129 @@ impl App {
                 draw_center(ui, &font, &format!("{buf}_"), 22.0, AMBER_C, (w, h * 0.45 + 40.0));
             }
             MenuScreen::Options => {
-                draw_center(ui, &font, t(self.lang, OPT_LANG), 20.0, WHITE_C, (w, h * 0.4));
-                draw_center(
-                    ui,
-                    &font,
-                    &format!("{} : {:.1}", t(self.lang, OPT_SENS), self.config.sensitivity),
-                    20.0,
-                    WHITE_C,
-                    (w, h * 0.4 + 40.0),
-                );
-                draw_center(
-                    ui,
-                    &font,
-                    &format!("{} : {}", t(self.lang, OPT_NAME), self.config.name),
-                    20.0,
-                    WHITE_C,
-                    (w, h * 0.4 + 80.0),
-                );
-                let rs_label = if self.config.render_scale <= 0.0 {
-                    let cur = self
-                        .renderer
-                        .as_ref()
-                        .map(|r| r.render_scale())
-                        .unwrap_or(1.0);
-                    format!("auto ({:.0}%)", cur * 100.0)
+                // Voile : masque le titre de fond pour la lisibilité du panneau.
+                ui.push(UiOp::Rect { x: 0.0, y: 0.0, w, h, color: [0.012, 0.015, 0.024, 0.94] });
+                draw_center(ui, &font, t(self.lang, BTN_OPTIONS), 30.0, WHITE_C, (w, h * 0.10));
+
+                // Layout adaptatif : sous 620 px de haut, rangées compactes.
+                let compact = h < 620.0;
+                let gap = if compact { 40.0 } else { 48.0 };
+                let bh = if compact { 28.0 } else { 36.0 };
+                let top = h * 0.18;
+
+                // Langue + nom (les libellés contiennent déjà leur valeur).
+                let bh_lang = if compact { 28.0 } else { 40.0 };
+                self.button(ui, &font, BtnAction::Lang, w / 2.0 - 320.0, top, 310.0, bh_lang, t(self.lang, OPT_LANG), BtnState::Normal);
+                self.button(ui, &font, BtnAction::Name, w / 2.0 + 10.0, top, 310.0, bh_lang, &format!("{} : {}", t(self.lang, OPT_NAME).replace("[N] ", ""), self.config.name), BtnState::Normal);
+
+                // Sensibilité.
+                let row_y = top + gap;
+                let sens_label = format!("{} : {:.1}", t(self.lang, OPT_SENS).replace("[<> ] ", ""), self.config.sensitivity);
+                let sens_w = crate::gpu::ui::text_width(&font, &sens_label, 18.0);
+                self.button(ui, &font, BtnAction::SensDown, w / 2.0 - 180.0, row_y, 44.0, bh, "-", BtnState::Normal);
+                self.button(ui, &font, BtnAction::SensUp, w / 2.0 + 136.0, row_y, 44.0, bh, "+", BtnState::Normal);
+                ui.push(UiOp::text(w / 2.0 - sens_w / 2.0, row_y + bh / 2.0 - 9.0, 18.0, WHITE_C, &sens_label));
+
+                // Résolution (DRS manuel).
+                let row_y = top + gap * 2.0;
+                ui.push(UiOp::text(w / 2.0 - 320.0, row_y + bh / 2.0 - 8.0, 17.0, DIM_C, t(self.lang, OPT_RESOLUTION)));
+                let rs_vals: [(u8, &str); 5] = [
+                    (0, t(self.lang, RS_AUTO)),
+                    (1, "100%"),
+                    (2, "85%"),
+                    (3, "70%"),
+                    (4, "55%"),
+                ];
+                let cur_res = if self.config.render_scale <= 0.0 {
+                    0
+                } else if (self.config.render_scale - 1.0).abs() < 1e-3 {
+                    1
+                } else if (self.config.render_scale - 0.85).abs() < 1e-3 {
+                    2
+                } else if (self.config.render_scale - 0.7).abs() < 1e-3 {
+                    3
                 } else {
-                    format!("{:.0}%", self.config.render_scale * 100.0)
+                    4
                 };
-                draw_center(
-                    ui,
-                    &font,
-                    &format!("{} : {}", t(self.lang, OPT_RENDER), rs_label),
-                    20.0,
-                    WHITE_C,
-                    (w, h * 0.4 + 120.0),
-                );
-                let rt_label = match self.config.rt_mode {
-                    1 => t(self.lang, RT_QUAL),
-                    2 => t(self.lang, RT_ULTRA),
-                    _ => t(self.lang, RT_OFF),
-                };
-                draw_center(
-                    ui,
-                    &font,
-                    &format!("{} : {}", t(self.lang, OPT_RT), rt_label),
-                    16.0,
-                    if self.config.rt_mode > 0 { AMBER_C } else { WHITE_C },
-                    (w, h * 0.4 + 160.0),
-                );
-                draw_center(ui, &font, t(self.lang, BACK_HINT), 16.0, DIM_C, (w, h * 0.75));
+                for (i, (v, label)) in rs_vals.iter().enumerate() {
+                    let state = if cur_res == *v { BtnState::Selected } else { BtnState::Normal };
+                    self.button(ui, &font, BtnAction::Res(*v), w / 2.0 - 100.0 + i as f32 * 84.0, row_y, 78.0, bh, label, state);
+                }
+
+                // Upscaling : Natif / FSR 3 / DLSS.
+                let row_y = top + gap * 3.0;
+                ui.push(UiOp::text(w / 2.0 - 320.0, row_y + bh / 2.0 - 8.0, 17.0, DIM_C, t(self.lang, OPT_UPSCALING)));
+                let rtx = self.renderer.as_ref().map(|r| r.adapter_name.to_uppercase().contains("RTX")).unwrap_or(false);
+                let ups_items: [(u8, &str, BtnState); 3] = [
+                    (0, t(self.lang, UP_NATIVE), if self.config.upscaler == 0 { BtnState::Selected } else { BtnState::Normal }),
+                    (1, t(self.lang, UP_FSR3), if self.config.upscaler == 1 { BtnState::Selected } else { BtnState::Normal }),
+                    (2, t(self.lang, UP_DLSS), if self.config.upscaler == 2 { BtnState::Selected } else if rtx { BtnState::Normal } else { BtnState::Disabled }),
+                ];
+                for (i, (v, label, state)) in ups_items.iter().enumerate() {
+                    self.button(ui, &font, BtnAction::Ups(*v), w / 2.0 - 100.0 + i as f32 * 110.0, row_y, 104.0, bh, label, *state);
+                }
+                if !rtx {
+                    ui.push(UiOp::text(w / 2.0 + 236.0, row_y + bh / 2.0 - 6.0, 13.0, DIM_C, t(self.lang, DLSS_NEED_RTX)));
+                }
+
+                // Preset qualité (visible si upscaling actif).
+                if self.config.upscaler > 0 {
+                    let row_y = top + gap * 4.0;
+                    ui.push(UiOp::text(w / 2.0 - 320.0, row_y + bh / 2.0 - 8.0, 17.0, DIM_C, t(self.lang, UP_Q_LABEL)));
+                    let q_items: [(u8, &str); 3] = [
+                        (0, t(self.lang, UP_QUALITY)),
+                        (1, t(self.lang, UP_BALANCED)),
+                        (2, t(self.lang, UP_PERF)),
+                    ];
+                    for (i, (v, label)) in q_items.iter().enumerate() {
+                        let state = if self.config.upscale_quality == *v { BtnState::Selected } else { BtnState::Normal };
+                        self.button(ui, &font, BtnAction::UpsQ(*v), w / 2.0 - 100.0 + i as f32 * 110.0, row_y, 104.0, bh, label, state);
+                    }
+                    if !compact {
+                        ui.push(UiOp::text(w / 2.0 - 100.0, row_y + bh + 8.0, 12.0, DIM_C, t(self.lang, UP_NOTE)));
+                    }
+                }
+
+                // Ray tracing.
+                let row_y = if self.config.upscaler > 0 { top + gap * 5.0 } else { top + gap * 4.0 };
+                ui.push(UiOp::text(w / 2.0 - 320.0, row_y + bh / 2.0 - 8.0, 17.0, DIM_C, &t(self.lang, OPT_RT).replace("[T] ", "")));
+                let rt_items: [(u8, &str); 3] = [
+                    (0, t(self.lang, RT_OFF)),
+                    (1, t(self.lang, UP_QUALITY)),
+                    (2, t(self.lang, RT_ULTRA).split(" — ").next().unwrap_or("Ultra")),
+                ];
+                for (i, (v, label)) in rt_items.iter().enumerate() {
+                    let state = if self.config.rt_mode == *v { BtnState::Selected } else { BtnState::Normal };
+                    self.button(ui, &font, BtnAction::Rt(*v), w / 2.0 - 100.0 + i as f32 * 110.0, row_y, 104.0, bh, label, state);
+                }
+
+                let back_y = (row_y + bh + if compact { 14.0 } else { 30.0 }).max(h * 0.86);
+                let back_h = if compact { 30.0 } else { 38.0 };
+                self.button(ui, &font, BtnAction::Back, w / 2.0 - 110.0, back_y.min(h - back_h - 8.0), 220.0, back_h, t(self.lang, BTN_BACK), BtnState::Normal);
             }
+        }
+    }
+
+    /// Dessine un bouton (fond, bordure, label) et l'enregistre pour les clics.
+    fn button(&mut self, ui: &mut Vec<UiOp>, font: &crate::gpu::ui::FontData, action: BtnAction, x: f32, y: f32, w: f32, h: f32, label: &str, state: BtnState) {
+        let hovered = self.cursor_pos.0 >= x
+            && self.cursor_pos.0 <= x + w
+            && self.cursor_pos.1 >= y
+            && self.cursor_pos.1 <= y + h;
+        let (border, bg, txt) = match state {
+            BtnState::Disabled => ([0.14, 0.16, 0.2, 0.7], [0.05, 0.06, 0.08, 0.85], [0.38, 0.4, 0.44, 0.8]),
+            BtnState::Selected => ([0.95, 0.65, 0.2, 1.0], [0.1, 0.12, 0.09, 0.95], [1.0, 0.85, 0.5, 1.0]),
+            BtnState::Normal if hovered => ([1.0, 0.78, 0.3, 1.0], [0.09, 0.11, 0.14, 0.95], WHITE_C),
+            BtnState::Normal => ([0.28, 0.33, 0.38, 0.9], [0.07, 0.09, 0.12, 0.9], WHITE_C),
+        };
+        ui.push(UiOp::Rect { x, y, w, h, color: border });
+        ui.push(UiOp::Rect { x: x + 2.0, y: y + 2.0, w: w - 4.0, h: h - 4.0, color: bg });
+        let tw = crate::gpu::ui::text_width(font, label, 18.0);
+        let size = if tw > w - 16.0 { 15.0 } else { 18.0 };
+        let tw = crate::gpu::ui::text_width(font, label, size);
+        ui.push(UiOp::text(x + w / 2.0 - tw / 2.0, y + h / 2.0 - size * 0.62, size, txt, label));
+        if state != BtnState::Disabled {
+            self.hot_btns.push(HotBtn { action, rect: [x, y, w, h] });
         }
     }
 
@@ -920,11 +1262,12 @@ impl App {
             y += 36.0;
         }
         if is_host {
-            draw_center(ui, &font, t(self.lang, LOBBY_HOST), 22.0, AMBER_C, (w, h * 0.72));
+            draw_center(ui, &font, t(self.lang, LOBBY_HOST), 22.0, AMBER_C, (w, h * 0.66));
+            self.button(ui, &font, BtnAction::StartGame, w / 2.0 - 160.0, h * 0.74, 320.0, 44.0, t(self.lang, BTN_START), BtnState::Normal);
         } else {
             draw_center(ui, &font, t(self.lang, LOBBY_WAIT), 22.0, DIM_C, (w, h * 0.72));
         }
-        draw_center(ui, &font, t(self.lang, LEAVE_HINT), 15.0, DIM_C, (w, h * 0.85));
+        self.button(ui, &font, BtnAction::LeaveLobby, w / 2.0 - 130.0, h * 0.88, 260.0, 36.0, t(self.lang, BTN_LEAVE), BtnState::Normal);
     }
 
     fn draw_gameover(
@@ -966,6 +1309,7 @@ impl App {
             (w, h * 0.55),
         );
         draw_center(ui, &font, t(self.lang, AGAIN_HINT), 18.0, AMBER_C, (w, h * 0.75));
+        self.button(ui, &font, BtnAction::OverMenu, w / 2.0 - 130.0, h * 0.84, 260.0, 40.0, t(self.lang, BTN_TO_MENU), BtnState::Normal);
     }
 }
 
@@ -1045,6 +1389,13 @@ impl App {
                         g.yaw += a;
                     }
                 }
+                AutoAct::Mouse(x, y) => {
+                    self.cursor_pos = (x as f32, y as f32);
+                }
+                AutoAct::Click(x, y) => {
+                    self.cursor_pos = (x as f32, y as f32);
+                    self.on_click();
+                }
                 AutoAct::Exit => {
                     self.config.save();
                     println!("[autopilot] fin");
@@ -1060,18 +1411,29 @@ impl ApplicationHandler for App {
         if self.window.is_some() {
             return;
         }
+        let (ww, wh) = std::env::var("SL3_WINDOW_SIZE")
+            .ok()
+            .and_then(|s| {
+                let (a, b) = s.split_once('x')?;
+                Some((a.trim().parse::<f64>().ok()?, b.trim().parse::<f64>().ok()?))
+            })
+            .unwrap_or((1280.0, 720.0));
         let attrs = Window::default_attributes()
             .with_title("SUPPORT LEVEL -3")
-            .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 720.0));
+            .with_inner_size(winit::dpi::LogicalSize::new(ww, wh));
         let window = el.create_window(attrs).expect("fenêtre");
         let window = Arc::new(window);
         let mut renderer = Renderer::new(window.clone());
+        if std::env::var("SL3_DEBUG").is_ok() {
+            eprintln!("[sl3-debug] renderer créé : {}", renderer.adapter_name);
+        }
         // 1er lancement sur un GPU ray tracing (RTX) : active le mode Qualité.
         if self.fresh_config && renderer.adapter_name.to_lowercase().contains("rtx") {
             self.config.rt_mode = 1;
             self.config.save();
         }
         renderer.set_rt_mode(self.config.rt_mode);
+        renderer.set_upscaler(self.config.upscaler, self.config.upscale_quality);
         self.window = Some(window);
         self.renderer = Some(renderer);
     }
@@ -1110,6 +1472,17 @@ impl ApplicationHandler for App {
                             ));
                         }
                     }
+                } else {
+                    // Menus : suivi du curseur pour survol + clic des boutons.
+                    self.cursor_pos = (position.x as f32, position.y as f32);
+                }
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                if !self.cursor_locked
+                    && button == winit::event::MouseButton::Left
+                    && state == ElementState::Pressed
+                {
+                    self.on_click();
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
@@ -1130,6 +1503,14 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::RedrawRequested => {
+                if std::env::var("SL3_DEBUG").is_ok() {
+                    static FIRST: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+                    let t0 = FIRST.get_or_init(Instant::now);
+                    let n = FRAME_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if n < 3 || n % 25 == 0 {
+                        eprintln!("[sl3-debug] frame {n} (t={:?})", t0.elapsed());
+                    }
+                }
                 self.frame();
             }
             _ => {}

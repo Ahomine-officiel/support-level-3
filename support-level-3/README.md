@@ -74,7 +74,7 @@ Test rapide sans GUI : `./target/release/sl3-server --bots 2` démarre une room 
 
 **Régénération des assets** : après modification de `assets/`, relancez `python3 tools/gen_bundle.py` pour rembarquer les fichiers dans le binaire (le test `bundle_covers_disk_exactly` vérifie la cohérence).
 
-**Mode autopilot (dev/QA)** : `SL3_AUTOPILOT="key Digit1@1; shot /tmp/x.png@3; yaw 90@4; exit@5" ./sl3-client` pilote le jeu et capture des écrans automatiquement — c'est ce qui a permis de valider visuellement le rendu (menu, lobby, HUD, RT) sur pilote logiciel.
+**Mode autopilot (dev/QA)** : `SL3_AUTOPILOT="key Digit1@1; click 640 420@2; shot /tmp/x.png@3; mouse 640 300@3.5; yaw 90@4; exit@5" ./sl3-client` pilote le jeu (touches, **clics souris sur les boutons**, déplacement du curseur, yaw caméra) et capture des écrans automatiquement — c'est ce qui a permis de valider visuellement le rendu (menu cliquable, options FSR 3/DLSS, lobby, HUD, RT) sur pilote logiciel. `SL3_WINDOW_SIZE=640x360` réduit la fenêtre (tests sur pilote logiciel), `SL3_DEBUG=1` trace les frames et les clics.
 
 ## 🎮 Commandes
 
@@ -86,9 +86,41 @@ Test rapide sans GUI : `./target/release/sl3-server --bots 2` démarre une room 
 | `E` | Interagir (maintenir : reboot, terminal, disjoncteur, relever) |
 | `F` | Lampe torche (batterie !) |
 | `F5` | Ray tracing : Off → Qualité → Ultra (en jeu) |
+| `F6` | Upscaling : Natif → FSR 3 → DLSS (en jeu) |
 | `F12` | Capture d'écran PNG (à côté de l'exe) |
 | `Échap` | Pause / retour |
 | `F1` | Basculer **FR ⇄ EN** |
+| Souris (menus) | **Tous les menus sont cliquables** : boutons, survol, options en un clic |
+
+## 🚀 Upscaling FSR 3 / DLSS (boutons dans Options)
+
+Le client embarque un **upscaling temporel maison — port WGSL du noyau FSR 3**
+(FidelityFX Super Resolution 2/3 d'AMD, MIT) : reconstruction plein écran à
+partir d'un rendu interne réduit, avec **vecteurs de mouvement** (reprojection
+de la profondeur), **dilatation** (voisin le plus proche), **Lanczos 2 à biais
+de noyau**, **boîte de rectification** (variance YCoCg), **reprojection de
+l'historique** (Lanczos 4×4) et **RCAS** (netteté FSR en espace perceptuel).
+Jitter Halton(2,3) sur 8 phases appliqué à la projection.
+
+Dans **Options** (boutons cliquables) :
+
+| Bouton | Rôle |
+|---|---|
+| **Natif** | rendu pleine résolution classique (défaut) |
+| **FSR 3** | upscaling temporel sur tous les GPU — interne ×1.5 / ×1.7 / ×2.0 selon le preset |
+| **DLSS** | même moteur temporel, bouton **activé sur RTX uniquement** (grisé « RTX requis » ailleurs) ; le SDK NVIDIA fermé ne peut pas être intégré, nous fournissons notre reconstruction du même type |
+| **Qualité d'upscaling** | Qualité (×1.5) / Équilibré (×1.7) / Performance (×2.0) |
+
+- La ligne perf affiche `– FSR 3 Qualité` (ou DLSS) quand c'est actif.
+- **L'UI reste toujours en pleine résolution** (menus, HUD, textes nets).
+- Le preset se **combine à l'échelle de rendu** (DRS) : échelle interne =
+  DRS × preset — l'auto-DRS continue de protéger le framerate.
+- `F6` en jeu cycle Natif → FSR 3 → (DLSS si RTX), avec toast dans le journal.
+- L'historique temporel est invalidé proprement (redimensionnement, changement
+  de preset, début de partie, téléport).
+- Limites assumées : pas de masques réactifs/transparence ni depth-clip
+  (scatter) du SDK complet — inutiles pour cette scène LDR ; la génération
+  d'images (frame interpolation) n'est pas incluse.
 
 ## 🖥️ Performances (vieux PC / iGPU)
 
@@ -147,7 +179,7 @@ cargo test
 - Tests unitaires **server** : reboot complet d'un serveur, validation de la note de frais → ouverture de la sortie → évasion → fin de partie, audition de l'entité.
 - Test d'intégration **lobby** : lance le vrai binaire serveur et joue toute la séquence en TCP (Hello → CreateRoom → mauvais mot de passe → JoinRoom → StartGame → GameStarted → snapshots → LeaveRoom).
 - Test **assets** (client) : chaque GLTF charge via le même parseur que le jeu, matériaux connus du moteur, indices dans les bornes, budget de triangles respecté.
-- Tests **shaders** (client) : les 4 shaders WGSL (world, post, ui, rt) sont parsés et validés par **naga** — erreurs de GPU détectées sans GPU.
+- Tests **shaders** (client) : les 5 shaders WGSL (world, post, ui, rt, upscale) sont parsés et validés par **naga** — erreurs de GPU détectées sans GPU.
 - Tests **rtscene** (client) : fusion des murs (couverture de chaque cellule `#`), budget de boîtes, AABB tournées, cohérence de la scène statique.
 
 ## 🏗️ Architecture

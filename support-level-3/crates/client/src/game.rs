@@ -553,12 +553,22 @@ impl Game {
     }
 
     /// Matrice view_proj inversée (reconstruction de position dans la passe RT).
-    pub fn inv_view_proj(&self, aspect: f32) -> [[f32; 4]; 4] {
+    pub fn inv_view_proj(&self, aspect: f32, jitter_ndc: [f32; 2]) -> [[f32; 4]; 4] {
+        self.view_proj_mat(aspect, jitter_ndc).inverse().to_cols_array_2d()
+    }
+
+    /// (proj * vue), avec décalage NDC du jitter subpixel (upscaling temporel).
+    fn view_proj_mat(&self, aspect: f32, jitter_ndc: [f32; 2]) -> glam::Mat4 {
         let eye = self.cam_eye();
         let dir = self.forward();
         let view = glam::Mat4::look_at_rh(eye, eye + dir, Vec3::Y);
         let proj = glam::Mat4::perspective_rh(74f32.to_radians(), aspect, 0.05, 120.0);
-        (proj * view).inverse().to_cols_array_2d()
+        let vp = proj * view;
+        if jitter_ndc[0] == 0.0 && jitter_ndc[1] == 0.0 {
+            vp
+        } else {
+            glam::Mat4::from_translation([jitter_ndc[0], jitter_ndc[1], 0.0].into()) * vp
+        }
     }
 
     fn cam_eye(&self) -> Vec3 {
@@ -605,12 +615,10 @@ impl Game {
     }
 
     /// Uniform du monde (view_proj, lumières, torche, brouillard).
-    pub fn world_uniform(&self, aspect: f32) -> WorldUniform {
+    pub fn world_uniform(&self, aspect: f32, jitter_ndc: [f32; 2]) -> WorldUniform {
         let eye = self.cam_eye();
         let dir = self.forward();
-        let view = glam::Mat4::look_at_rh(eye, eye + dir, Vec3::Y);
-        let proj = glam::Mat4::perspective_rh(74f32.to_radians(), aspect, 0.05, 120.0);
-        let view_proj = (proj * view).to_cols_array_2d();
+        let view_proj = self.view_proj_mat(aspect, jitter_ndc).to_cols_array_2d();
 
         let mut u = WorldUniform {
             view_proj,

@@ -14,6 +14,12 @@ pub struct Config {
     /// Ray tracing : 0 = désactivé, 1 = qualité (ombres + AO), 2 = ultra (+ GI).
     #[serde(default)]
     pub rt_mode: u8,
+    /// Upscaling : 0 = natif, 1 = FSR 3 (temporel), 2 = DLSS (même noyau, RTX requis).
+    #[serde(default)]
+    pub upscaler: u8,
+    /// Preset qualité upscaling : 0 = qualité, 1 = équilibré, 2 = performance.
+    #[serde(default)]
+    pub upscale_quality: u8,
 }
 
 impl Default for Config {
@@ -26,6 +32,8 @@ impl Default for Config {
             volume: 0.8,
             render_scale: 0.0,
             rt_mode: 0,
+            upscaler: 0,
+            upscale_quality: 0,
         }
     }
 }
@@ -45,6 +53,8 @@ impl Config {
             Ok(s) => {
                 let mut c: Config = serde_json::from_str(&s).unwrap_or_default();
                 c.rt_mode = c.rt_mode.min(2);
+                c.upscaler = c.upscaler.min(2);
+                c.upscale_quality = c.upscale_quality.min(2);
                 c
             }
             Err(_) => Config::default(),

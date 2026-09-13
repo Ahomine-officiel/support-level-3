@@ -89,6 +89,29 @@ pub const RT_OFF: usize = 62;
 pub const RT_QUAL: usize = 63;
 pub const RT_ULTRA: usize = 64;
 pub const RT_TOAST: usize = 65;
+pub const BTN_HOST: usize = 66;
+pub const BTN_JOIN: usize = 67;
+pub const BTN_OPTIONS: usize = 68;
+pub const BTN_QUIT: usize = 69;
+pub const BTN_BACK: usize = 70;
+pub const BTN_START: usize = 71;
+pub const BTN_LEAVE: usize = 72;
+pub const BTN_RESUME: usize = 73;
+pub const BTN_QUITMENU: usize = 74;
+pub const BTN_TO_MENU: usize = 75;
+pub const OPT_UPSCALING: usize = 76;
+pub const UP_NATIVE: usize = 77;
+pub const UP_FSR3: usize = 78;
+pub const UP_DLSS: usize = 79;
+pub const UP_Q_LABEL: usize = 80;
+pub const UP_QUALITY: usize = 81;
+pub const UP_BALANCED: usize = 82;
+pub const UP_PERF: usize = 83;
+pub const DLSS_NEED_RTX: usize = 84;
+pub const OPT_RESOLUTION: usize = 85;
+pub const RS_AUTO: usize = 86;
+pub const UP_TOAST: usize = 87;
+pub const UP_NOTE: usize = 88;
 
 pub fn t(lang: Lang, key: usize) -> &'static str {
     let (fr, en) = TEXTS[key];
@@ -251,4 +274,50 @@ pub const TEXTS: &[(&str, &str)] = &[
     ("Ultra — + rebond de lumière (GI)", "Ultra — + light bounce (GI)"),
     // 65
     ("Ray tracing", "Ray tracing"),
+    // 66
+    ("Héberger une partie", "Host a game"),
+    // 67
+    ("Rejoindre une partie", "Join a game"),
+    // 68
+    ("Options", "Options"),
+    // 69
+    ("Quitter", "Quit"),
+    // 70
+    ("Retour", "Back"),
+    // 71
+    ("Démarrer la partie", "Start the game"),
+    // 72
+    ("Quitter le salon", "Leave lobby"),
+    // 73
+    ("Reprendre", "Resume"),
+    // 74
+    ("Quitter vers le menu", "Quit to menu"),
+    // 75
+    ("Menu", "Menu"),
+    // 76
+    ("Upscaling", "Upscaling"),
+    // 77
+    ("Natif", "Native"),
+    // 78
+    ("FSR 3", "FSR 3"),
+    // 79
+    ("DLSS", "DLSS"),
+    // 80
+    ("Qualité d'upscaling", "Upscaling quality"),
+    // 81
+    ("Qualité", "Quality"),
+    // 82
+    ("Équilibré", "Balanced"),
+    // 83
+    ("Performance", "Performance"),
+    // 84
+    ("RTX requis", "RTX required"),
+    // 85
+    ("Résolution", "Resolution"),
+    // 86
+    ("Auto", "Auto"),
+    // 87
+    ("Upscaling", "Upscaling"),
+    // 88
+    ("Reconstruction temporelle avec vecteurs de mouvement (port FSR 3)", "Temporal reconstruction with motion vectors (FSR 3 port)"),
 ];
