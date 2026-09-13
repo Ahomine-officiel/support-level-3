@@ -70,17 +70,15 @@ pub struct FontData {
 }
 
 pub fn load_font(device: &wgpu::Device, queue: &wgpu::Queue) -> (super::texture::GpuTexture, FontData) {
-    let path = std::path::Path::new("assets/font/font_atlas.png");
-    let png = std::fs::read(path).expect("font_atlas.png manquant");
-    let img = image::load_from_memory_with_format(&png, image::ImageFormat::Png)
+    let png = crate::assets::read_expect("font/font_atlas.png");
+    let img = image::load_from_memory_with_format(png, image::ImageFormat::Png)
         .expect("atlas invalide")
         .to_rgba8();
     let (w, h) = img.dimensions();
 
-    let raw: RawFont = serde_json::from_str(
-        &std::fs::read_to_string("assets/font/font_atlas.json").expect("font_atlas.json manquant"),
-    )
-    .expect("font json invalide");
+    let raw: RawFont =
+        serde_json::from_slice(crate::assets::read_expect("font/font_atlas.json"))
+            .expect("font json invalide");
 
     let mut glyphs = HashMap::new();
     for (ch_s, g) in raw.glyphs {
@@ -98,7 +96,7 @@ pub fn load_font(device: &wgpu::Device, queue: &wgpu::Queue) -> (super::texture:
         );
     }
 
-    let tex = super::texture::load_png_opts(device, queue, path, false);
+    let tex = super::texture::load_png_opts(device, queue, "font/font_atlas.png", false);
     (
         tex,
         FontData {

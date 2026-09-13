@@ -31,8 +31,17 @@ impl Default for Config {
 }
 
 impl Config {
+    /// Fichier de config à côté de l'exécutable (l'exe est autoportant) ;
+    /// repli sur le dossier courant si le chemin de l'exe est indisponible.
+    pub fn path() -> std::path::PathBuf {
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("sl3_config.json")))
+            .unwrap_or_else(|| std::path::PathBuf::from("sl3_config.json"))
+    }
+
     pub fn load() -> Config {
-        match std::fs::read_to_string("sl3_config.json") {
+        match std::fs::read_to_string(Self::path()) {
             Ok(s) => {
                 let mut c: Config = serde_json::from_str(&s).unwrap_or_default();
                 c.rt_mode = c.rt_mode.min(2);
@@ -44,7 +53,7 @@ impl Config {
 
     pub fn save(&self) {
         if let Ok(s) = serde_json::to_string_pretty(self) {
-            let _ = std::fs::write("sl3_config.json", s);
+            let _ = std::fs::write(Self::path(), s);
         }
     }
 }

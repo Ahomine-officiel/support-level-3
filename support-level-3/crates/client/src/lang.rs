@@ -222,7 +222,7 @@ pub const TEXTS: &[(&str, &str)] = &[
     // 50
     ("[L] Langue / Language : FR", "[L] Language / Langue : EN"),
     // 51
-    ("[←/→] Sensibilité souris", "[←/→] Mouse sensitivity"),
+    ("[<> ] Sensibilité souris", "[<> ] Mouse sensitivity"),
     // 52
     ("[N] Changer de nom", "[N] Change name"),
     // 53
@@ -232,7 +232,7 @@ pub const TEXTS: &[(&str, &str)] = &[
     // 55
     ("TICKETS EN COURS", "OPEN TICKETS"),
     // 56
-    ("ZQSD/WASD bouger · Souris regarder · Maj courir · E interagir · F torche", "WASD move · Mouse look · Shift run · E interact · F torch"),
+    ("ZQSD/WASD bouger – Souris regarder – Maj courir – E interagir – F torche", "WASD move – Mouse look – Shift run – E interact – F torch"),
     // 57
     ("Hôte", "Host"),
     // 58

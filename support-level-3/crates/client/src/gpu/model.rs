@@ -2,7 +2,6 @@
 
 use glam::Vec3;
 use std::collections::HashMap;
-use std::path::Path;
 use wgpu::util::DeviceExt;
 use wgpu::*;
 
@@ -39,9 +38,23 @@ pub struct Model {
     pub bounds: (Vec3, Vec3),
 }
 
-pub fn load_model(device: &Device, path: &Path) -> Model {
-    let (doc, buffers, _images) =
-        gltf::import(path).unwrap_or_else(|e| panic!("GLTF invalide {}: {}", path.display(), e));
+/// Charge un modèle embarqué par son nom (`models/<name>.gltf` + `.bin`).
+pub fn load_model(device: &Device, name: &str) -> Model {
+    let json = crate::assets::read_expect(&format!("models/{name}.gltf"));
+    let doc =
+        gltf::Gltf::from_slice(json).unwrap_or_else(|e| panic!("GLTF invalide {name}: {e}"));
+    // Résolution des buffers depuis la mémoire (équivalent mémoire de gltf::import).
+    let buffers: Vec<gltf::buffer::Data> = doc
+        .buffers()
+        .map(|b| match b.source() {
+            gltf::buffer::Source::Bin => {
+                gltf::buffer::Data(doc.blob.clone().expect("GLB sans section BIN"))
+            }
+            gltf::buffer::Source::Uri(uri) => gltf::buffer::Data(
+                crate::assets::read_expect(&format!("models/{uri}")).to_vec(),
+            ),
+        })
+        .collect();
     let mut parts: Vec<PartGpu> = Vec::new();
     let mut bmin = Vec3::splat(f32::MAX);
     let mut bmax = Vec3::splat(f32::MIN);
@@ -113,16 +126,11 @@ pub fn load_model(device: &Device, path: &Path) -> Model {
     Model { parts, bounds }
 }
 
-/// Charge tous les modèles du dossier assets/models.
+/// Charge tous les modèles embarqués (`models/*.gltf`).
 pub fn load_all_models(device: &Device) -> HashMap<String, Model> {
     let mut out = HashMap::new();
-    for entry in std::fs::read_dir("assets/models").expect("dossier assets/models") {
-        let entry = entry.unwrap();
-        let p = entry.path();
-        if p.extension().map(|e| e == "gltf").unwrap_or(false) {
-            let name = p.file_stem().unwrap().to_string_lossy().to_string();
-            out.insert(name, load_model(device, &p));
-        }
+    for name in crate::assets::stems_with_ext("models", "gltf") {
+        out.insert(name.to_string(), load_model(device, name));
     }
     out
 }

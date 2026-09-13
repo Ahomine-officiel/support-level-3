@@ -11,7 +11,6 @@ pub use ui::UiOp;
 use model::{Model, Vertex};
 use sl3_shared::map::MapData;
 use std::collections::HashMap;
-use std::path::Path;
 use winit::window::Window;
 use wgpu::util::DeviceExt;
 
@@ -164,8 +163,18 @@ pub struct Renderer {
     pub white_bg: wgpu::BindGroup,
     pub font: ui::FontData,
     ui_buf: wgpu::Buffer,
+    /// Index buffer UI : motif (0,1,2, 1,3,2) répété — un quad = 4 sommets consécutifs.
+    ui_index_buf: wgpu::Buffer,
+    /// Capacité (en quads) de ui_index_buf — agrandie au besoin comme ui_buf.
+    ui_index_cap: u32,
 
     dyn_scratch: HashMap<PartKey, (wgpu::Buffer, u64)>,
+
+    // ----- Capture d'écran (autopilot / [F12]) -----
+    /// Si défini : la frame courante est rendue dans une texture dédiée puis
+    /// écrite en PNG à ce chemin (une seule fois).
+    pub capture_path: Option<std::path::PathBuf>,
+    capture_tex: Option<wgpu::Texture>,
 
     // ----- Ray tracing optionnel -----
     /// 0 = désactivé, 1 = qualité (ombres + AO), 2 = ultra (+ rebond GI).
@@ -257,8 +266,7 @@ impl Renderer {
             "light_panel", "hazard", "poster_a", "poster_b", "poster_c", "poster_d",
         ] {
             let (file, strength) = material_def(name);
-            let path = Path::new("assets/textures").join(format!("{file}.png"));
-            let tex = texture::load_png(&device, &queue, &path);
+            let tex = texture::load_png(&device, &queue, &format!("textures/{file}.png"));
             let mat_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: None,
                 contents: bytemuck::cast_slice(&[1.0f32, 1.0, 1.0, strength]),
@@ -450,6 +458,18 @@ impl Renderer {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        // Index buffer UI : chaque quad de 4 sommets est déroulé en 2 triangles
+        // (TL,TR,BL) + (TR,BR,BL) — sinon seuls les quads à 1 instance s'affichent.
+        let mut ui_idx: Vec<u32> = Vec::with_capacity(4096 * 6);
+        for q in 0..4096u32 {
+            let v = q * 4;
+            ui_idx.extend_from_slice(&[v, v + 1, v + 2, v + 1, v + 3, v + 2]);
+        }
+        let ui_index_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("ui-indices"),
+            contents: bytemuck::cast_slice(&ui_idx),
+            usage: wgpu::BufferUsages::INDEX,
+        });
 
         Renderer {
             device,
@@ -477,7 +497,11 @@ impl Renderer {
             white_bg,
             font,
             ui_buf,
+            ui_index_buf,
+            ui_index_cap: 4096,
             dyn_scratch: HashMap::new(),
+            capture_path: None,
+            capture_tex: None,
             rt_mode: 0,
             rt_scale: 0.4,
             world_bind_layout,
@@ -724,7 +748,16 @@ impl Renderer {
                 })],
                 compilation_options: Default::default(),
             }),
-            primitive: wgpu::PrimitiveState { cull_mode: None, ..Default::default() },
+            // Quads UI en TriangleList via index buffer partagé (voir ui_index_buf).
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                unclipped_depth: false,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                conservative: false,
+            },
             depth_stencil: None,
             multisample: Default::default(),
             multiview: None,
@@ -1040,6 +1073,38 @@ impl Renderer {
         let frame = self.surface.get_current_texture()?;
         let frame_view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
 
+        // Capture demandée ? On rend la frame dans une texture COPY_SRC dédiée
+        // (mêmes pipelines : même format que la surface) au lieu de la swapchain.
+        let capture_path = self.capture_path.take();
+        let final_view;
+        if capture_path.is_some() {
+            let size = frame.texture.size();
+            let rebuild = match &self.capture_tex {
+                Some(t) => t.size() != size,
+                None => true,
+            };
+            if rebuild {
+                let tex = self.device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("capture"),
+                    size,
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: self.surface_config.format,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                    view_formats: &[],
+                });
+                self.capture_tex = Some(tex);
+            }
+            final_view = self
+                .capture_tex
+                .as_ref()
+                .unwrap()
+                .create_view(&wgpu::TextureViewDescriptor::default());
+        } else {
+            final_view = frame_view;
+        }
+
         self.queue
             .write_buffer(&self.world_uniform_buf, 0, bytemuck::bytes_of(world_uniform));
         self.queue
@@ -1084,6 +1149,22 @@ impl Renderer {
                     usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                     mapped_at_creation: false,
                 });
+            }
+            // L'index buffer suit : 6 indices u32 par quad.
+            let quads_needed = (verts.len() / 4) as u32;
+            if self.ui_index_cap < quads_needed {
+                let cap = (quads_needed * 2).max(8192);
+                let mut idx: Vec<u32> = Vec::with_capacity(cap as usize * 6);
+                for q in 0..cap {
+                    let v = q * 4;
+                    idx.extend_from_slice(&[v, v + 1, v + 2, v + 1, v + 3, v + 2]);
+                }
+                self.ui_index_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("ui-indices"),
+                    contents: bytemuck::cast_slice(&idx),
+                    usage: wgpu::BufferUsages::INDEX,
+                });
+                self.ui_index_cap = cap;
             }
             self.queue.write_buffer(&self.ui_buf, 0, bytemuck::cast_slice(&verts));
         }
@@ -1210,7 +1291,7 @@ impl Renderer {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("post-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &frame_view,
+                    view: &final_view,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
@@ -1231,7 +1312,7 @@ impl Renderer {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("ui-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &frame_view,
+                    view: &final_view,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Load,
@@ -1244,7 +1325,11 @@ impl Renderer {
             });
             pass.set_pipeline(&self.ui_pipeline);
             pass.set_bind_group(0, &self.ui_bind0, &[]);
+            pass.set_index_buffer(self.ui_index_buf.slice(..), wgpu::IndexFormat::Uint32);
             let stride = std::mem::size_of::<ui::UiVertex>() as u64;
+            // Un seul vertex buffer global : les indices du motif pointent en absolu.
+            let total_bytes = verts.len() as u64 * stride;
+            pass.set_vertex_buffer(0, self.ui_buf.slice(0..total_bytes));
             let mut cursor = 0u64;
             for (_op, (is_text, quads)) in ui_ops.iter().zip(draws.iter()) {
                 if *quads == 0 {
@@ -1254,15 +1339,69 @@ impl Renderer {
                     true => pass.set_bind_group(1, &self.font_bg, &[]),
                     false => pass.set_bind_group(1, &self.white_bg, &[]),
                 }
-                let bytes = *quads as u64 * 4 * stride;
-                pass.set_vertex_buffer(0, self.ui_buf.slice(cursor..cursor + bytes));
-                pass.draw(0..4, 0..*quads);
-                cursor += bytes;
+                // Chaque quad de 4 sommets consomme 6 indices du motif partagé.
+                let q0 = (cursor / stride / 4) as u32;
+                pass.draw_indexed(q0 * 6..(q0 + *quads) * 6, 0, 0..1);
+                cursor += *quads as u64 * 4 * stride;
             }
         }
 
         self.queue.submit(Some(encoder.finish()));
         frame.present();
+        if let Some(path) = capture_path {
+            self.save_capture(&path);
+        }
         Ok(())
+    }
+
+    /// Écrit la texture de capture dans un PNG (lecture bloquante one-shot).
+    fn save_capture(&self, path: &std::path::Path) {
+        let Some(tex) = &self.capture_tex else { return };
+        let size = tex.size();
+        let (w, h) = (size.width, size.height);
+        let bpr = (w * 4).div_ceil(256) * 256;
+        let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("capture-read"),
+            size: (bpr * h) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("capture-copy"),
+        });
+        enc.copy_texture_to_buffer(
+            wgpu::ImageCopyTexture {
+                texture: tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::ImageCopyBuffer {
+                buffer: &buf,
+                layout: wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bpr),
+                    rows_per_image: Some(h),
+                },
+            },
+            size,
+        );
+        self.queue.submit(Some(enc.finish()));
+        buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        let _ = self.device.poll(wgpu::Maintain::Wait);
+        {
+            let data = buf.slice(..).get_mapped_range();
+            let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+            for row in 0..h {
+                let start = (row * bpr) as usize;
+                rgba.extend_from_slice(&data[start..start + (w * 4) as usize]);
+            }
+            if let Err(e) = image::save_buffer(path, &rgba, w, h, image::ColorType::Rgba8) {
+                eprintln!("[capture] échec {} : {e}", path.display());
+            } else {
+                println!("[capture] {} ({}x{})", path.display(), w, h);
+            }
+        }
+        buf.unmap();
     }
 }

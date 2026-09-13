@@ -45,6 +45,83 @@ enum Pending {
     Join { code: String, password: String },
 }
 
+// ----- Autopilot (scénario de rendu automatisé, via SL3_AUTOPILOT) -----
+
+struct AutoStep {
+    at: f64,
+    act: AutoAct,
+}
+
+enum AutoAct {
+    Key(KeyCode),
+    Shot(String),
+    Yaw(f32),
+    Exit,
+}
+
+impl Clone for AutoAct {
+    fn clone(&self) -> Self {
+        match self {
+            AutoAct::Key(k) => AutoAct::Key(*k),
+            AutoAct::Shot(p) => AutoAct::Shot(p.clone()),
+            AutoAct::Yaw(a) => AutoAct::Yaw(*a),
+            AutoAct::Exit => AutoAct::Exit,
+        }
+    }
+}
+
+struct Auto {
+    t0: Instant,
+    steps: Vec<AutoStep>,
+    next: usize,
+}
+
+fn parse_key(name: &str) -> Option<KeyCode> {
+    Some(match name {
+        "Enter" | "NumpadEnter" => KeyCode::Enter,
+        "Digit1" => KeyCode::Digit1,
+        "Digit2" => KeyCode::Digit2,
+        "Digit3" => KeyCode::Digit3,
+        "Space" => KeyCode::Space,
+        "Escape" => KeyCode::Escape,
+        "Backspace" => KeyCode::Backspace,
+        "F5" => KeyCode::F5,
+        "KeyF" => KeyCode::KeyF,
+        "KeyE" => KeyCode::KeyE,
+        _ => return None,
+    })
+}
+
+/// Format : « key Digit1@1.0 ; shot /tmp/x.png@3.0 ; exit@3.2 »
+fn parse_autopilot(s: &str) -> Option<Auto> {
+    let mut steps = Vec::new();
+    for tok in s.split(';') {
+        let tok = tok.trim();
+        if tok.is_empty() {
+            continue;
+        }
+        let (head, at) = tok.rsplit_once('@')?;
+        let at: f64 = at.trim().parse().ok()?;
+        let mut parts = head.splitn(2, ' ');
+        let verb = parts.next().unwrap_or("").trim();
+        let arg = parts.next().unwrap_or("").trim();
+        let act = match verb {
+            "key" => AutoAct::Key(parse_key(arg)?),
+            "shot" => AutoAct::Shot(arg.to_string()),
+            "yaw" => AutoAct::Yaw(arg.parse::<f32>().ok()?.to_radians()),
+            "exit" => AutoAct::Exit,
+            _ => return None,
+        };
+        steps.push(AutoStep { at, act });
+    }
+    steps.sort_by(|a, b| a.at.partial_cmp(&b.at).unwrap_or(std::cmp::Ordering::Equal));
+    if steps.is_empty() {
+        None
+    } else {
+        Some(Auto { t0: Instant::now(), steps, next: 0 })
+    }
+}
+
 const WHITE_C: [f32; 4] = [0.9, 0.92, 0.95, 1.0];
 const DIM_C: [f32; 4] = [0.6, 0.63, 0.66, 0.85];
 const GREEN_C: [f32; 4] = [0.5, 0.95, 0.55, 1.0];
@@ -73,14 +150,19 @@ pub struct App {
     players: Vec<LobbyPlayer>,
     /// Vrai si aucun fichier de config n'existait (1er lancement : auto-config RT).
     fresh_config: bool,
+    /// Scénario autopilot (SL3_AUTOPILOT) : capture d'écrans automatisée.
+    auto: Option<Auto>,
 }
 
 impl App {
     fn new() -> App {
-        let fresh_config = !std::path::Path::new("sl3_config.json").exists();
+        let fresh_config = !Config::path().exists();
         let config = Config::load();
         let lang = Lang::from_str(&config.lang);
         let audio = Audio::new(config.volume);
+        let auto = std::env::var("SL3_AUTOPILOT")
+            .ok()
+            .and_then(|s| parse_autopilot(&s));
         App {
             config,
             lang,
@@ -101,6 +183,7 @@ impl App {
             map: None,
             players: Vec::new(),
             fresh_config,
+            auto,
         }
     }
 
@@ -308,6 +391,17 @@ impl App {
     // ---------------- Clavier ----------------
 
     fn on_key_pressed(&mut self, code: KeyCode, _el: &ActiveEventLoop) {
+        if code == KeyCode::F12 {
+            // Capture d'écran instantanée -> PNG à côté de l'exécutable.
+            let ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            if let Some(r) = &mut self.renderer {
+                r.capture_path = Some(std::path::PathBuf::from(format!("sl3_shot_{ms}.png")));
+            }
+            return;
+        }
         if code == KeyCode::F1 {
             self.lang.toggle();
             self.config.lang = match self.lang {
@@ -640,8 +734,8 @@ impl App {
                 // Ligne perf (haut-droite) : FPS + échelle de rendu + indicateur RT.
                 let fps = (1.0 / self.ema_frame.max(1e-4)) as u32;
                 let pct = (self.renderer.as_ref().unwrap().render_scale() * 100.0).round() as u32;
-                let rt_tag = if self.config.rt_mode > 0 { " · RT" } else { "" };
-                let perf = format!("{fps} FPS · rendu {pct}%{rt_tag}");
+                let rt_tag = if self.config.rt_mode > 0 { " – RT" } else { "" };
+                let perf = format!("{fps} FPS – rendu {pct}%{rt_tag}");
                 let tw = crate::gpu::ui::text_width(&font, &perf, 13.0);
                 ui_ops.push(UiOp::text(w - tw - 12.0, 10.0, 13.0, [0.62, 0.68, 0.62, 0.75], &perf));
                 if self.paused {
@@ -720,7 +814,7 @@ impl App {
             MenuScreen::AskHostAddr { buf } => {
                 draw_center(ui, &font, t(self.lang, ADDR_PROMPT), 20.0, WHITE_C, (w, h * 0.45));
                 draw_center(ui, &font, &format!("{buf}_"), 22.0, AMBER_C, (w, h * 0.45 + 40.0));
-                draw_center(ui, &font, &format!("{} · [Entrée] valider", t(self.lang, BACK_HINT)), 14.0, DIM_C, (w, h * 0.8));
+                draw_center(ui, &font, &format!("{} – [Entrée] valider", t(self.lang, BACK_HINT)), 14.0, DIM_C, (w, h * 0.8));
             }
             MenuScreen::HostPassword { buf } => {
                 let shown: String = buf.chars().map(|_| '*').collect();
@@ -862,7 +956,7 @@ impl App {
             ui,
             &font,
             &format!(
-                "{} {mins:02}:{secs:02}   ·   {} {servers}/6   ·   {} {escaped}",
+                "{} {mins:02}:{secs:02}   –   {} {servers}/6   –   {} {escaped}",
                 t(self.lang, TIME),
                 t(self.lang, SERVERS),
                 t(self.lang, ESCAPED)
@@ -918,6 +1012,47 @@ fn rand_int(n: u32) -> u32 {
         s.set(x);
         x % n.max(1)
     })
+}
+
+impl App {
+    fn pump_autopilot(&mut self, el: &ActiveEventLoop) {
+        let mut due: Vec<AutoAct> = Vec::new();
+        if let Some(auto) = self.auto.as_mut() {
+            let t = auto.t0.elapsed().as_secs_f64();
+            while auto.next < auto.steps.len() && auto.steps[auto.next].at <= t {
+                due.push(auto.steps[auto.next].act.clone());
+                auto.next += 1;
+            }
+        } else {
+            return;
+        }
+        for act in due {
+            match act {
+                AutoAct::Key(c) => {
+                    self.keys.insert(c);
+                    self.on_key_pressed(c, el);
+                    self.keys.remove(&c);
+                    self.on_key_released(c);
+                }
+                AutoAct::Shot(p) => {
+                    if let Some(r) = self.renderer.as_mut() {
+                        r.capture_path = Some(std::path::PathBuf::from(&p));
+                        println!("[autopilot] capture -> {p}");
+                    }
+                }
+                AutoAct::Yaw(a) => {
+                    if let Some(g) = self.game.as_mut() {
+                        g.yaw += a;
+                    }
+                }
+                AutoAct::Exit => {
+                    self.config.save();
+                    println!("[autopilot] fin");
+                    el.exit();
+                }
+            }
+        }
+    }
 }
 
 impl ApplicationHandler for App {
@@ -1001,8 +1136,9 @@ impl ApplicationHandler for App {
         }
     }
 
-    fn about_to_wait(&mut self, _el: &ActiveEventLoop) {
+    fn about_to_wait(&mut self, el: &ActiveEventLoop) {
         self.handle_net_events();
+        self.pump_autopilot(el);
         if let Some(win) = &self.window {
             win.request_redraw();
         }

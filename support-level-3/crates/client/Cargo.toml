@@ -12,6 +12,7 @@ sl3-shared = { path = "../shared" }
 serde = { workspace = true }
 bincode = { workspace = true }
 glam = { workspace = true }
+log = "0.4"
 serde_json = "1"
 image = { version = "0.25", default-features = false, features = ["png"] }
 gltf = { version = "1.4", default-features = false, features = ["import", "utils", "names"] }

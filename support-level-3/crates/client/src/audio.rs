@@ -5,8 +5,6 @@ pub mod backend {
     use rodio::source::Source;
     use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink};
     use std::collections::HashMap;
-    use std::io::BufReader;
-    use std::path::Path;
 
     pub struct Audio {
         _stream: OutputStream,
@@ -36,9 +34,8 @@ pub mod backend {
         }
 
         fn load_sink(&self, name: &str, looping: bool) -> Option<Sink> {
-            let path = Path::new("assets/audio").join(format!("{name}.wav"));
-            let file = std::fs::File::open(path).ok()?;
-            let src = Decoder::new(BufReader::new(file)).ok()?;
+            let bytes = crate::assets::read(&format!("audio/{name}.wav"))?;
+            let src = Decoder::new(std::io::Cursor::new(bytes)).ok()?;
             let sink = Sink::try_new(&self.handle).ok()?;
             if looping {
                 sink.append(src.repeat_infinite());

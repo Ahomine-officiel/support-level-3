@@ -3,7 +3,6 @@
 //! + sampler anisotrope — moins d'aliasing, meilleure bande passante sur iGPU.
 
 use image::ImageFormat;
-use std::path::Path;
 use wgpu::*;
 
 pub struct GpuTexture {
@@ -55,21 +54,21 @@ fn downsample(src: &[u8], w: u32, h: u32) -> (Vec<u8>, u32, u32) {
     (out, nw, nh)
 }
 
-pub fn load_png(device: &Device, queue: &Queue, path: &Path) -> GpuTexture {
-    load_png_opts(device, queue, path, true)
+pub fn load_png(device: &Device, queue: &Queue, key: &str) -> GpuTexture {
+    load_png_opts(device, queue, key, true)
 }
 
+/// `key` = chemin embarqué (ex. « textures/concrete.png », « font/font_atlas.png »).
 /// `with_mips = false` pour les atlas UI (texte net à toute taille).
-pub fn load_png_opts(device: &Device, queue: &Queue, path: &Path, with_mips: bool) -> GpuTexture {
-    let data = std::fs::read(path)
-        .unwrap_or_else(|e| panic!("texture manquante {}: {}", path.display(), e));
-    let img = image::load_from_memory_with_format(&data, ImageFormat::Png)
+pub fn load_png_opts(device: &Device, queue: &Queue, key: &str, with_mips: bool) -> GpuTexture {
+    let data = crate::assets::read_expect(key);
+    let img = image::load_from_memory_with_format(data, ImageFormat::Png)
         .expect("PNG invalide")
         .to_rgba8();
     let (w, h) = img.dimensions();
     let mips = if with_mips { w.max(h).max(1).ilog2() + 1 } else { 1 };
     let tex = device.create_texture(&TextureDescriptor {
-        label: Some(path.to_str().unwrap_or("tex")),
+        label: Some(key),
         size: Extent3d { width: w, height: h, depth_or_array_layers: 1 },
         mip_level_count: mips,
         sample_count: 1,

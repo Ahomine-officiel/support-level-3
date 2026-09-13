@@ -49,11 +49,11 @@ Binaires produites : `target/release/sl3-client` (le jeu) et `target/release/sl3
 - **Windows / macOS** : rien à installer.
 - **Linux** : `sudo apt install libasound2-dev` (ou l'équivalent de votre distribution). Sans ALSA : `cargo build --release -p sl3-client --no-default-features` (jeu muet).
 
-**Lancement** : exécutez depuis la racine du projet (le client charge `assets/` relativement au répertoire courant) :
+**Lancement** : l'exécutable est **autoportant** — toutes les ressources (modèles, textures, sons, police) sont **embarquées dans le binaire**. Lancez-le depuis n'importe quel dossier, copiez-le seul, déplacez-le : aucune dépendance à `assets/` (la config `sl3_config.json` est créée à côté de l'exe).
 
 ```bash
 ./target/release/sl3-server --port 27070     # terminal 1 : le serveur
-./target/release/sl3-client                  # terminal 2 : le jeu
+./target/release/sl3-client                  # terminal 2 : le jeu (fonctionne d'où vous voulez)
 ```
 
 ## 🌐 Jouer en ligne (rooms)
@@ -70,6 +70,12 @@ Le client se connecte toujours à une **adresse de serveur** (par défaut `127.0
 
 Test rapide sans GUI : `./target/release/sl3-server --bots 2` démarre une room avec 2 bots qui errent et réparent.
 
+**[F12] en jeu** : sauvegarde une capture d'écran PNG à côté de l'exécutable.
+
+**Régénération des assets** : après modification de `assets/`, relancez `python3 tools/gen_bundle.py` pour rembarquer les fichiers dans le binaire (le test `bundle_covers_disk_exactly` vérifie la cohérence).
+
+**Mode autopilot (dev/QA)** : `SL3_AUTOPILOT="key Digit1@1; shot /tmp/x.png@3; yaw 90@4; exit@5" ./sl3-client` pilote le jeu et capture des écrans automatiquement — c'est ce qui a permis de valider visuellement le rendu (menu, lobby, HUD, RT) sur pilote logiciel.
+
 ## 🎮 Commandes
 
 | Touche | Action |
@@ -80,6 +86,7 @@ Test rapide sans GUI : `./target/release/sl3-server --bots 2` démarre une room 
 | `E` | Interagir (maintenir : reboot, terminal, disjoncteur, relever) |
 | `F` | Lampe torche (batterie !) |
 | `F5` | Ray tracing : Off → Qualité → Ultra (en jeu) |
+| `F12` | Capture d'écran PNG (à côté de l'exe) |
 | `Échap` | Pause / retour |
 | `F1` | Basculer **FR ⇄ EN** |
 
