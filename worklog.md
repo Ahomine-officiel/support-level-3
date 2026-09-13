@@ -46,3 +46,25 @@ Stage Summary:
 - Modèles chanfreinés très plus détaillés, normales sortantes garanties, matériaux inchangés (zéro modification serveur/protocole).
 - Résolution dynamique auto+manuelle : iGPU HD 630 (i7-7700) jouable à 1080p, UI nette à toute échelle.
 - Vérifié : cargo build (debug+release) 0 warning, cargo test 8/8, smoke test bots release OK ; rendu GPU à confirmer visuellement sur machine de bureau (pas de GPU dans le conteneur).
+
+---
+Task ID: 3
+Agent: Super Z (agent principal)
+Task: Ajouter une option ray tracing OPTIONNELLE et optimisée (RTX 2060 utilisateur) à SUPPORT LEVEL -3 — continuation Rust+wgpu.
+
+Work Log:
+- Environnement réinitialisé entre les sessions : rustup réinstallé (Rust 1.98.1) + ALSA re-extrait (libasound2t64 + libasound2-dev 1.2.14 → ~/.local-alsa). Piège RUSTFLAGS : le « ~ » littéral n'est pas développé par l'éditeur de liens → chemin $HOME absolu.
+- Choix technique : wgpu 22 n'expose pas les RT cores (DXR/VK_RT) → ray tracing par rayons en fragment shader contre une scène AABB simplifiée (compute units, ~10 % GPU en 1080p sur RTX 2060). Intégration : pre-pass profondeur (pipeline vertex-seul, fragment: None) → passe RT fullscreen MRT rgba16f (rt.wgsl) → passe monde variante (depth LessEqual, write off) qui échantillonne le résultat RT par projection de wpos. Hors RT : textures 1×1 f16 neutres (1,1,0) → rendu strictement identique à la v2, un seul pipeline de bind group.
+- shaders/rt.wgsl : reconstruction wpos via inv_view_proj depuis la profondeur, normale par différences de profondeur voisines, ombres des néons (moyenne pondérée par contribution att²·N·L, jitter stable par pixel/lumière → pénombres sans scintillement), ombre de la torche (déterministe, cone test), AO (1 rayon cosinus hémisphère, hash stable), GI approximative (1 rebond : contribution des néons depuis le point touché + normale de face d'AABB). Slab test ray-AABB avec garde anti-boîte dégénérée + safe_dir (division par zéro).
+- gpu/rtscene.rs (CPU pur, testable) : fusion gourmande des cellules '#' en rectangles maximaux (~2+50 boîtes au lieu de ~700), sol+plafond en 2 dalles, mobilier occlusif (rack/desk_set/shelf/box_small/pillar/breaker/terminal/exit_door) via AABB transformée (8 coins), budget MAX_STATIC 384 / MAX_DYN 32. Boîtes dynamiques par frame (game.rs) : panneaux de porte animés (bloquent la lumière quand fermés), baies serveurs, joueurs distants, Auditeur.
+- gpu/mod.rs : fields RT (rt_mode 0/1/2, rt_scale 0.4/0.5), world_bind_layout 4 entrées (uniform + sampler + rt0 + rt1), make_world_bind0, world_pipeline_with(depth_write, depth_compare) → 2 pipelines monde, prepass_pipeline, rt_pipeline (MRT 2 cibles Rgba16Float), rt_bind (params + world uniforms + 2 storage read-only + depth Depth24Plus en texture_depth_2d), cibles RT recréées sur resize/set_render_scale/set_rt_mode, update_rt_statics (upload une fois par partie), render(rt: Option<RtFrame>) avec séquence pré-pass → rt-pass → monde. Refactor : upload_dynamics(&mut self) → plan, puis draw_instances_pass(&self, plan) — résout le conflit &mut (RenderPipeline non-Clone en wgpu 22).
+- game.rs : Game::new(&mut Renderer) → update_rt_statics, rt_dynamic_boxes(models), inv_view_proj + cam_eye extrait (partagé avec world_uniform).
+- config.rs : rt_mode u8 (serde default 0, clamp 2) persisté ; lang.rs : 5 clés FR/EN (OPT_RT, RT_OFF, RT_QUAL, RT_ULTRA, RT_TOAST) ; app.rs : [T] dans Options, F5 en jeu (toast dans le journal), ligne perf « · RT », auto-détection 1er lancement (adapter_name contient "RTX" → mode Qualité), render() passe RtFrame.
+- Bonus fix : cartons invisibles depuis la v1 — map.rs 'o' poussait le modèle « box » au lieu de « box_small ».
+- Tests nouveaux : tests/shaders.rs (parse + validation naga 22.1 des 4 WGSL — erreurs GPU détectées sans GPU, la toolchain naga est la même version que wgpu 22 donc zéro surcoût) + tests/rtscene.rs (couverture de chaque cellule mur, budget, AABB tournée 45°, boîtes dégénérées). 14/14 verts (3 shared + 3 server + 1 intégration TCP + 1 assets + 4 rtscene + 2 shaders).
+- Builds debug + release 0 warning ; smoke test release serveur+3 bots OK (capture de l'Auditeur + cooldown visibles) ; README (section Ray tracing optionnel, tableau des modes, limites AABB) ; zip re-packagé avec binaires release frais (10,4 Mo, 183 fichiers).
+
+Stage Summary:
+- Livrable : /home/z/my-project/download/support-level-3.zip (sources + assets v2 + tools + binaires Linux release dans bin/).
+- Ray tracing : 3 modes Off/Qualité/Ultra (F5 en jeu, [T] Options, persisté, auto-activé sur RTX au 1er lancement) ; Off = zéro coût et rendu identique ; Qualité = ombres douces + AO (40 % res) ; Ultra = + GI (50 % res). Le tampon RT suit le DRS existant.
+- Vérifié : cargo build debug+release 0 warning, cargo test 14/14 (dont validation naga des shaders), smoke bots release OK ; rendu GPU réel à confirmer sur la RTX 2060 (pas de GPU dans le conteneur).

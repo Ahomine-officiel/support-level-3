@@ -79,6 +79,7 @@ Test rapide sans GUI : `./target/release/sl3-server --bots 2` démarre une room 
 | `Maj` | Courir (endurance limitée — et ça attire l'Auditeur) |
 | `E` | Interagir (maintenir : reboot, terminal, disjoncteur, relever) |
 | `F` | Lampe torche (batterie !) |
+| `F5` | Ray tracing : Off → Qualité → Ultra (en jeu) |
 | `Échap` | Pause / retour |
 | `F1` | Basculer **FR ⇄ EN** |
 
@@ -97,6 +98,38 @@ surfaces sans couture en 512 px — peu d'aliasing, moins de bande passante.
 Un i7 de 7e génération (iGPU HD 630) tourne confortablement à 1080p en laissant
 l'auto à 60-75 %.
 
+## ✨ Ray tracing (optionnel, RTX 2060+)
+
+Le client propose un **vrai ray tracing par rayons** (ombres, occlusion ambiante,
+rebond de lumière), calculé en shader contre une scène simplifiée en boîtes
+(AABB) — ~80 boîtes statiques fusionnées + les objets dynamiques (portes,
+baies serveurs, joueurs, l'Auditeur). wgpu 22 n'expose pas les RT cores (DXR),
+les rayons tournent donc sur les unités de calcul : très rapide sur une RTX 2060
+(~10 % du GPU en 1080p), et **strictement hors du chemin de rendu quand c'est
+désactivé**.
+
+Trois modes (mémorisés dans `sl3_config.json`) :
+
+| Mode | Effets | Coût |
+|---|---|---|
+| **Off** (défaut) | rendu classique identique à la v2 | zéro |
+| **Qualité** | ombres douces des néons (pénombres stables) + ombre de la torche + occlusion ambiante | tampon RT à 40 % de la résolution |
+| **Ultra** | + un rebond de lumière (GI approximatif) teinté par les néons | tampon RT à 50 % |
+
+- **En jeu** : `F5` cycle les modes (message dans le journal) — la ligne perf
+  affiche `· RT` quand c'est actif.
+- **Menu** : Options → `[T] Ray tracing`.
+- **Auto-détection** : au premier lancement sur un GPU **RTX**, le mode
+  *Qualité* est activé automatiquement.
+- Le tampon RT suit l'échelle de rendu dynamique : si le DRS baisse,
+  la passe RT baisse avec — pas de surprise sur la courbe de FPS.
+- Sur une vieille machine (iGPU), laissez simplement **Off** : aucune texture,
+  aucune passe, aucun octet de plus.
+
+Pipelines impliqués : `prepass-depth` (profondeur vertex-seul) → `rt-pass`
+(rayons : ombres/AO/GI, MRT rgba16f) → passe monde qui lit le résultat RT
+(textures 1×1 neutres quand le RT est Off → image identique).
+
 ## 🧪 Tests
 
 ```bash
@@ -107,6 +140,8 @@ cargo test
 - Tests unitaires **server** : reboot complet d'un serveur, validation de la note de frais → ouverture de la sortie → évasion → fin de partie, audition de l'entité.
 - Test d'intégration **lobby** : lance le vrai binaire serveur et joue toute la séquence en TCP (Hello → CreateRoom → mauvais mot de passe → JoinRoom → StartGame → GameStarted → snapshots → LeaveRoom).
 - Test **assets** (client) : chaque GLTF charge via le même parseur que le jeu, matériaux connus du moteur, indices dans les bornes, budget de triangles respecté.
+- Tests **shaders** (client) : les 4 shaders WGSL (world, post, ui, rt) sont parsés et validés par **naga** — erreurs de GPU détectées sans GPU.
+- Tests **rtscene** (client) : fusion des murs (couverture de chaque cellule `#`), budget de boîtes, AABB tournées, cohérence de la scène statique.
 
 ## 🏗️ Architecture
 
@@ -122,6 +157,9 @@ support-level-3/
 │   │               capture, cooldown), bots de smoke test.
 │   └── client/     Moteur wgpu 22 + winit 0.30 :
 │                   • pipeline monde (instances, néons, lampe torche spot, brouillard)
+│                   • ray tracing optionnel : pré-pass profondeur + passe de
+│                     rayons (ombres douces, AO, GI) contre une scène AABB
+│                     fusionnée (rt.wgsl + rtscene.rs), 3 modes Off/Qualité/Ultra
 │                   • post-process « vision de panique » (distorsion, grain, vignette)
 │                   • résolution dynamique (offscreen ×échelle, upscale post, UI 1:1)
 │                   • mipmaps CPU (espace linéaire) + anisotropie ×8
@@ -153,7 +191,9 @@ python3 tools/gen_font.py       # l'atlas de police (accents FR inclus)
 ## 📝 Notes de conception / limites connues
 
 - Prototype coop : pas de revivals après expulsion, pas de chat texte (journal d'événements uniquement).
-- Pas de mipmaps (le brouillard masque l'aliasing lointain) — amélioration future : blit pipeline.
+- Le ray tracing est une approximation géométrique (AABB) : les pénombres sont
+  correctes aux portes/murs/meubles, les petits objets (cartons, extincteurs)
+  ne projettent pas d'ombre.
 - L'IA de l'Auditeur est déterministe en grille (BFS) : rapide et robuste, sans pathfinding hiérarchique.
 - Le client fait confiance à la position annoncée des autres joueurs : assumé pour une coop entre amis.
 

@@ -2141,6 +2141,7 @@ dependencies = [
  "glam",
  "gltf",
  "image",
+ "naga",
  "pollster",
  "rodio",
  "serde",

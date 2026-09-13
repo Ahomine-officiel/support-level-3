@@ -135,6 +135,38 @@ pub fn white_texture(device: &Device, queue: &Queue) -> GpuTexture {
     GpuTexture { view: tex.create_view(&TextureViewDescriptor::default()) }
 }
 
+/// Texture 1x1 rgba16float (demi-flots bruts) — valeurs neutres du tampon RT
+/// quand le ray tracing est désactivé : (1, 1, 0, 1) = AO 1, ombres 1, GI 0.
+pub fn neutral_rt_texture(device: &Device, queue: &Queue, label: &str, rgba16: [u16; 4]) -> GpuTexture {
+    let tex = device.create_texture(&TextureDescriptor {
+        label: Some(label),
+        size: Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: TextureDimension::D2,
+        format: TextureFormat::Rgba16Float,
+        usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let bytes: [u8; 8] = bytemuck::cast_slice(&rgba16).try_into().unwrap();
+    queue.write_texture(
+        ImageCopyTexture {
+            texture: &tex,
+            mip_level: 0,
+            origin: Origin3d::ZERO,
+            aspect: TextureAspect::All,
+        },
+        &bytes,
+        ImageDataLayout {
+            offset: 0,
+            bytes_per_row: Some(256),
+            rows_per_image: None,
+        },
+        Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+    );
+    GpuTexture { view: tex.create_view(&TextureViewDescriptor::default()) }
+}
+
 pub fn linear_sampler(device: &Device, repeat: bool) -> Sampler {
     device.create_sampler(&SamplerDescriptor {
         label: Some("linear-mips"),

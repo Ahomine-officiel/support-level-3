@@ -84,6 +84,11 @@ pub const HOST_OF: usize = 57;
 pub const WAITING: usize = 58;
 pub const STAMINA: usize = 59;
 pub const OPT_RENDER: usize = 60;
+pub const OPT_RT: usize = 61;
+pub const RT_OFF: usize = 62;
+pub const RT_QUAL: usize = 63;
+pub const RT_ULTRA: usize = 64;
+pub const RT_TOAST: usize = 65;
 
 pub fn t(lang: Lang, key: usize) -> &'static str {
     let (fr, en) = TEXTS[key];
@@ -236,4 +241,14 @@ pub const TEXTS: &[(&str, &str)] = &[
     ("Endurance", "Stamina"),
     // 60
     ("Échelle de rendu [R]", "Render scale [R]"),
+    // 61
+    ("[T] Ray tracing", "[T] Ray tracing"),
+    // 62
+    ("Désactivé", "Off"),
+    // 63
+    ("Qualité — ombres douces + occlusion", "Quality — soft shadows + occlusion"),
+    // 64
+    ("Ultra — + rebond de lumière (GI)", "Ultra — + light bounce (GI)"),
+    // 65
+    ("Ray tracing", "Ray tracing"),
 ];

@@ -1,11 +1,15 @@
 //! Renderer wgpu : pipeline monde (instances + matériaux), post-process, UI.
+//! Ray tracing optionnel : pré-pass profondeur + passe de rayons (rt.wgsl)
+//! contre la scène AABB (rtscene.rs), appliquée dans world.wgsl.
 
 pub mod model;
+pub mod rtscene;
 pub mod texture;
 pub mod ui;
 pub use ui::UiOp;
 
 use model::{Model, Vertex};
+use sl3_shared::map::MapData;
 use std::collections::HashMap;
 use std::path::Path;
 use winit::window::Window;
@@ -105,6 +109,26 @@ pub struct StaticBatch {
     pub count: u32,
 }
 
+/// Uniform de la passe de ray tracing (miroir de shaders/rt.wgsl).
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct RtParams {
+    pub inv_vp: [[f32; 4]; 4],
+    pub cam_pos: [f32; 4],
+    /// x,y : taille tampon RT · z,w : taille texture profondeur.
+    pub dims: [f32; 4],
+    /// x : boîtes statiques · y : dynamiques · z : lumières · w : rayon AO (m).
+    pub counts: [f32; 4],
+    /// x : force GI (0 = désactivée) · y : AO appliquée à la lumière directe.
+    pub misc: [f32; 4],
+}
+
+/// Données par frame nécessaires au ray tracing (None = RT désactivé).
+pub struct RtFrame<'a> {
+    pub inv_vp: [[f32; 4]; 4],
+    pub dyn_boxes: &'a [rtscene::GpuAabb],
+}
+
 pub struct StaticBatches {
     pub batches: Vec<StaticBatch>,
     pub total_instances: usize,
@@ -142,6 +166,30 @@ pub struct Renderer {
     ui_buf: wgpu::Buffer,
 
     dyn_scratch: HashMap<PartKey, (wgpu::Buffer, u64)>,
+
+    // ----- Ray tracing optionnel -----
+    /// 0 = désactivé, 1 = qualité (ombres + AO), 2 = ultra (+ rebond GI).
+    pub rt_mode: u8,
+    /// Échelle du tampon RT relativement au tampon monde.
+    rt_scale: f32,
+    world_bind_layout: wgpu::BindGroupLayout,
+    world_pipeline_rt: wgpu::RenderPipeline,
+    prepass_pipeline: wgpu::RenderPipeline,
+    rt_pipeline: wgpu::RenderPipeline,
+    rt_bind_layout: wgpu::BindGroupLayout,
+    rt_bind: wgpu::BindGroup,
+    rt_params_buf: wgpu::Buffer,
+    rt_static_buf: wgpu::Buffer,
+    rt_dyn_buf: wgpu::Buffer,
+    rt_static_count: u32,
+    rt0_tex: wgpu::Texture,
+    rt1_tex: wgpu::Texture,
+    rt0_view: wgpu::TextureView,
+    rt1_view: wgpu::TextureView,
+    rt_neutral0: wgpu::TextureView,
+    rt_neutral1: wgpu::TextureView,
+    /// Nom de l'adaptateur GPU détecté (pour l'auto-configuration RT).
+    pub adapter_name: String,
 }
 
 impl Renderer {
@@ -157,6 +205,12 @@ impl Renderer {
             force_fallback_adapter: false,
         }))
         .expect("pas de GPU compatible (Vulkan/Metal/DX12 requis)");
+        let adapter_info = adapter.get_info();
+        let adapter_name = if adapter_info.name.is_empty() {
+            format!("{:?}", adapter_info.backend)
+        } else {
+            format!("{} ({:?})", adapter_info.name, adapter_info.backend)
+        };
 
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
@@ -238,20 +292,27 @@ impl Renderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
         let world_bind_layout = Self::world_bind_layout(&device);
-        let world_bind0 = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("world-bind0"),
-            layout: &world_bind_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: world_uniform_buf.as_entire_binding(),
-            }],
-        });
+        // Textures RT neutres (RT désactivé) : AO=1, ombres=1, GI=0 -> rendu identique.
+        let n0 = texture::neutral_rt_texture(&device, &queue, "rt-neutral0", [0x3C00, 0x3C00, 0x0000, 0x3C00]);
+        let n1 = texture::neutral_rt_texture(&device, &queue, "rt-neutral1", [0x0000, 0x0000, 0x0000, 0x3C00]);
+        let rt_neutral0 = n0.view;
+        let rt_neutral1 = n1.view;
+        let world_bind0 = Self::make_world_bind0(&device, &world_bind_layout, &world_uniform_buf, &rt_neutral0, &rt_neutral1);
 
         let world_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("world.wgsl"),
             source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/world.wgsl").into()),
         });
-        let world_pipeline = Self::world_pipeline(&device, &world_bind_layout, &mat_layout, &world_shader, format);
+        let world_pipeline = Self::world_pipeline_with(
+            &device, &world_bind_layout, &mat_layout, &world_shader, format,
+            true, wgpu::CompareFunction::Less,
+        );
+        // Variante RT : profondeur déjà écrite par la pré-pass -> test large, écriture off.
+        let world_pipeline_rt = Self::world_pipeline_with(
+            &device, &world_bind_layout, &mat_layout, &world_shader, format,
+            false, wgpu::CompareFunction::LessEqual,
+        );
+        let prepass_pipeline = Self::prepass_pipeline(&device, &world_bind_layout, &world_shader);
 
         // Post-process.
         let post_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -284,6 +345,54 @@ impl Renderer {
             ],
         });
         let post_pipeline = Self::post_pipeline(&device, &post_layout, &post_shader, format);
+
+        // ----- Ray tracing : shader, pipeline, buffers, bind group -----
+        let rt_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("rt.wgsl"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/rt.wgsl").into()),
+        });
+        let rt_bind_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("rt-layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 2, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 3, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 4, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Depth, multisampled: false, view_dimension: wgpu::TextureViewDimension::D2 }, count: None },
+            ],
+        });
+        let rt_pipeline = Self::rt_pipeline(&device, &rt_bind_layout, &rt_shader);
+        let rt_params_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("rt-params"),
+            size: std::mem::size_of::<RtParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let rt_static_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("rt-static-boxes"),
+            size: (rtscene::MAX_RT_STATIC_BOXES * std::mem::size_of::<rtscene::GpuAabb>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let rt_dyn_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("rt-dyn-boxes"),
+            size: (rtscene::MAX_RT_DYN_BOXES * std::mem::size_of::<rtscene::GpuAabb>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let (rt0_tex, rt0_view) = Self::make_rt_target(&device, 1, 1, "rt0");
+        let (rt1_tex, rt1_view) = Self::make_rt_target(&device, 1, 1, "rt1");
+        let rt_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("rt-bind"),
+            layout: &rt_bind_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: rt_params_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: world_uniform_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: rt_static_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: rt_dyn_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&depth_view) },
+            ],
+        });
 
         // UI.
         let ui_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -369,6 +478,25 @@ impl Renderer {
             font,
             ui_buf,
             dyn_scratch: HashMap::new(),
+            rt_mode: 0,
+            rt_scale: 0.4,
+            world_bind_layout,
+            world_pipeline_rt,
+            prepass_pipeline,
+            rt_pipeline,
+            rt_bind_layout,
+            rt_bind,
+            rt_params_buf,
+            rt_static_buf,
+            rt_dyn_buf,
+            rt_static_count: 0,
+            rt0_tex,
+            rt1_tex,
+            rt0_view,
+            rt1_view,
+            rt_neutral0,
+            rt_neutral1,
+            adapter_name,
         }
     }
 
@@ -380,12 +508,38 @@ impl Renderer {
     fn world_bind_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
         device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("world-layout0"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
-                count: None,
-            }],
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
+                wgpu::BindGroupLayoutEntry { binding: 2, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, multisampled: false, view_dimension: wgpu::TextureViewDimension::D2 }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 3, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, multisampled: false, view_dimension: wgpu::TextureViewDimension::D2 }, count: None },
+            ],
+        })
+    }
+
+    /// Bind group 0 du monde : uniform + sampler + textures RT (réelles ou neutres).
+    fn make_world_bind0(
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        uniform_buf: &wgpu::Buffer,
+        rt0: &wgpu::TextureView,
+        rt1: &wgpu::TextureView,
+    ) -> wgpu::BindGroup {
+        let sampler = texture::linear_sampler(device, false);
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("world-bind0"),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: uniform_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&sampler) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(rt0) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(rt1) },
+            ],
         })
     }
 
@@ -400,12 +554,14 @@ impl Renderer {
         })
     }
 
-    fn world_pipeline(
+    fn world_pipeline_with(
         device: &wgpu::Device,
         bind0: &wgpu::BindGroupLayout,
         bind1: &wgpu::BindGroupLayout,
         shader: &wgpu::ShaderModule,
         format: wgpu::TextureFormat,
+        depth_write: bool,
+        depth_compare: wgpu::CompareFunction,
     ) -> wgpu::RenderPipeline {
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("world-pll"),
@@ -434,11 +590,75 @@ impl Renderer {
             primitive: wgpu::PrimitiveState::default(),
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth24Plus,
+                depth_write_enabled: depth_write,
+                depth_compare,
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            multiview: None,
+            cache: None,
+        })
+    }
+
+    /// Pré-pass profondeur (vertex seul) pour la passe de ray tracing.
+    fn prepass_pipeline(device: &wgpu::Device, bind0: &wgpu::BindGroupLayout, shader: &wgpu::ShaderModule) -> wgpu::RenderPipeline {
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("prepass-pll"),
+            bind_group_layouts: &[bind0],
+            push_constant_ranges: &[],
+        });
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("prepass-pipeline"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: shader,
+                entry_point: "vs",
+                buffers: &[Vertex::LAYOUT, INSTANCE_LAYOUT],
+                compilation_options: Default::default(),
+            },
+            fragment: None,
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth24Plus,
                 depth_write_enabled: true,
                 depth_compare: wgpu::CompareFunction::Less,
                 stencil: Default::default(),
                 bias: Default::default(),
             }),
+            multisample: Default::default(),
+            multiview: None,
+            cache: None,
+        })
+    }
+
+    /// Passe RT : fullscreen triangle, deux cibles rgba16float (MRT).
+    fn rt_pipeline(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, shader: &wgpu::ShaderModule) -> wgpu::RenderPipeline {
+        let pll = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("rt-pll"),
+            bind_group_layouts: &[layout],
+            push_constant_ranges: &[],
+        });
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("rt-pipeline"),
+            layout: Some(&pll),
+            vertex: wgpu::VertexState {
+                module: shader,
+                entry_point: "vs",
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: shader,
+                entry_point: "fs",
+                targets: &[
+                    Some(wgpu::ColorTargetState { format: wgpu::TextureFormat::Rgba16Float, blend: None, write_mask: wgpu::ColorWrites::ALL }),
+                    Some(wgpu::ColorTargetState { format: wgpu::TextureFormat::Rgba16Float, blend: None, write_mask: wgpu::ColorWrites::ALL }),
+                ],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState { cull_mode: None, ..Default::default() },
+            depth_stencil: None,
             multisample: Default::default(),
             multiview: None,
             cache: None,
@@ -535,7 +755,23 @@ impl Renderer {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Depth24Plus,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+        (tex, view)
+    }
+
+    /// Cible rgba16float de la passe RT (RENDER_ATTACHMENT + TEXTURE_BINDING).
+    fn make_rt_target(device: &wgpu::Device, w: u32, h: u32, label: &str) -> (wgpu::Texture, wgpu::TextureView) {
+        let tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
         let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
@@ -559,6 +795,8 @@ impl Renderer {
         let (dt, dv) = Self::make_depth(&self.device, sw, sh);
         self.depth_tex = dt;
         self.depth_view = dv;
+        self.rebuild_rt_bind();
+        self.recreate_rt_targets();
         let ui_data = [w as f32, h as f32, 0.0, 0.0];
         self.queue.write_buffer(&self.ui_uniform_buf, 0, bytemuck::cast_slice(&ui_data));
     }
@@ -599,6 +837,85 @@ impl Renderer {
         let (dt, dv) = Self::make_depth(&self.device, sw, sh);
         self.depth_tex = dt;
         self.depth_view = dv;
+        self.rebuild_rt_bind();
+        self.recreate_rt_targets();
+    }
+
+    // ---------- ray tracing (optionnel) ----------
+
+    /// Échelle du tampon RT selon le mode : qualité 0.4x, ultra 0.5x du tampon monde.
+    fn rt_target_scale(mode: u8) -> f32 {
+        match mode {
+            2 => 0.5,
+            _ => 0.4,
+        }
+    }
+
+    /// Change de mode RT (0 désactivé / 1 qualité / 2 ultra) et recrée ce qu'il faut.
+    pub fn set_rt_mode(&mut self, mode: u8) {
+        let mode = mode.min(2);
+        if mode == self.rt_mode {
+            return;
+        }
+        self.rt_mode = mode;
+        self.rt_scale = Self::rt_target_scale(mode);
+        self.recreate_rt_targets();
+        self.rebuild_world_bind();
+    }
+
+    /// Recrée les cibles RT (dépendent du mode + de la taille du tampon monde).
+    fn recreate_rt_targets(&mut self) {
+        if self.rt_mode == 0 {
+            return;
+        }
+        let (ow, oh) = self.scaled_size();
+        let w = ((ow as f32 * self.rt_scale) as u32).max(1);
+        let h = ((oh as f32 * self.rt_scale) as u32).max(1);
+        let (t0, v0) = Self::make_rt_target(&self.device, w, h, "rt0");
+        let (t1, v1) = Self::make_rt_target(&self.device, w, h, "rt1");
+        self.rt0_tex = t0;
+        self.rt1_tex = t1;
+        self.rt0_view = v0;
+        self.rt1_view = v1;
+    }
+
+    /// Rebranche les textures RT réelles ou neutres sur le bind group du monde.
+    fn rebuild_world_bind(&mut self) {
+        let (v0, v1) = if self.rt_mode > 0 {
+            (&self.rt0_view, &self.rt1_view)
+        } else {
+            (&self.rt_neutral0, &self.rt_neutral1)
+        };
+        let bg = Self::make_world_bind0(&self.device, &self.world_bind_layout, &self.world_uniform_buf, v0, v1);
+        self.world_bind0 = bg;
+    }
+
+    /// Rebranche la texture profondeur (change à chaque resize / changement d'échelle).
+    fn rebuild_rt_bind(&mut self) {
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("rt-bind"),
+            layout: &self.rt_bind_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: self.rt_params_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: self.world_uniform_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: self.rt_static_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: self.rt_dyn_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&self.depth_view) },
+            ],
+        });
+        self.rt_bind = bg;
+    }
+
+    /// Reconstruit les boîtes statiques de la scène RT (au démarrage d'une partie).
+    pub fn update_rt_statics(&mut self, map: &MapData, insts: &[(String, InstanceData)]) {
+        let boxes = {
+            let models = &self.models;
+            rtscene::build_static_boxes(map, insts, |name| models.get(name).map(|m| m.bounds))
+        };
+        self.rt_static_count = boxes.len() as u32;
+        let mut padded = boxes;
+        padded.resize(rtscene::MAX_RT_STATIC_BOXES, rtscene::GpuAabb::ZERO);
+        self.queue.write_buffer(&self.rt_static_buf, 0, bytemuck::cast_slice(&padded));
     }
 
     pub fn render_scale(&self) -> f32 {
@@ -634,21 +951,10 @@ impl Renderer {
     }
 
     // ---------- dessin ----------
-    pub fn draw_instances_pass(
-        &mut self,
-        pass: &mut wgpu::RenderPass<'static>,
-        statics: &StaticBatches,
-        dynamics: &[(String, Vec<InstanceData>)],
-    ) {
-        pass.set_pipeline(&self.world_pipeline);
-        pass.set_bind_group(0, &self.world_bind0, &[]);
-
-        // Statiques.
-        for batch in &statics.batches {
-            self.draw_part(pass, &batch.key, &batch.buffer, batch.count);
-        }
-
-        // Dynamiques.
+    /// Upload les instances dynamiques dans le scratch GPU et renvoie le plan
+    /// de dessin (clé de part + nombre d'instances).
+    fn upload_dynamics(&mut self, dynamics: &[(String, Vec<InstanceData>)]) -> Vec<(PartKey, u32)> {
+        let mut plan = Vec::new();
         for (model_name, insts) in dynamics {
             let Some(model) = self.models.get(model_name) else { continue };
             for (pi, _part) in model.parts.iter().enumerate() {
@@ -675,8 +981,32 @@ impl Renderer {
                 }
                 let (buf, _cap) = &self.dyn_scratch[&key];
                 self.queue.write_buffer(buf, 0, bytemuck::cast_slice(&raws));
-                self.draw_part(pass, &key, buf, raws.len() as u32);
+                plan.push((key, raws.len() as u32));
             }
+        }
+        plan
+    }
+
+    /// Dessine statiques + dynamiques (plan préparé) avec le pipeline donné.
+    fn draw_instances_pass(
+        &self,
+        pass: &mut wgpu::RenderPass<'static>,
+        statics: &StaticBatches,
+        plan: &[(PartKey, u32)],
+        pipeline: &wgpu::RenderPipeline,
+    ) {
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &self.world_bind0, &[]);
+
+        // Statiques.
+        for batch in &statics.batches {
+            self.draw_part(pass, &batch.key, &batch.buffer, batch.count);
+        }
+
+        // Dynamiques (déjà uploadées).
+        for (key, count) in plan {
+            let (buf, _cap) = &self.dyn_scratch[key];
+            self.draw_part(pass, key, buf, *count);
         }
     }
 
@@ -701,6 +1031,7 @@ impl Renderer {
     pub fn render(
         &mut self,
         world_uniform: &WorldUniform,
+        rt: Option<RtFrame>,
         statics: &StaticBatches,
         dynamics: &[(String, Vec<InstanceData>)],
         ui_ops: &[ui::UiOp],
@@ -713,6 +1044,34 @@ impl Renderer {
             .write_buffer(&self.world_uniform_buf, 0, bytemuck::bytes_of(world_uniform));
         self.queue
             .write_buffer(&self.post_uniform_buf, 0, bytemuck::cast_slice(&post_params));
+
+        // Ray tracing actif ? Prépare uniform + boîtes dynamiques.
+        let rt_on = self.rt_mode > 0;
+        if let (true, Some(f)) = (rt_on, &rt) {
+            let (rt_w, rt_h) = (self.rt0_tex.size().width, self.rt0_tex.size().height);
+            let (dw, dh) = (self.depth_tex.size().width, self.depth_tex.size().height);
+            let params = RtParams {
+                inv_vp: f.inv_vp,
+                cam_pos: world_uniform.cam_pos,
+                dims: [rt_w as f32, rt_h as f32, dw as f32, dh as f32],
+                counts: [
+                    self.rt_static_count as f32,
+                    (f.dyn_boxes.len() as f32).min(rtscene::MAX_RT_DYN_BOXES as f32),
+                    world_uniform.misc[0],
+                    1.6,
+                ],
+                misc: [if self.rt_mode >= 2 { 0.55 } else { 0.0 }, 0.35, 0.0, 0.0],
+            };
+            self.queue.write_buffer(&self.rt_params_buf, 0, bytemuck::bytes_of(&params));
+            let mut boxes: Vec<rtscene::GpuAabb> = f
+                .dyn_boxes
+                .iter()
+                .take(rtscene::MAX_RT_DYN_BOXES)
+                .copied()
+                .collect();
+            boxes.resize(rtscene::MAX_RT_DYN_BOXES, rtscene::GpuAabb::ZERO);
+            self.queue.write_buffer(&self.rt_dyn_buf, 0, bytemuck::cast_slice(&boxes));
+        }
 
         // Quads UI.
         let (verts, draws) = ui::build_ui_verts(ui_ops, &self.font);
@@ -729,12 +1088,92 @@ impl Renderer {
             self.queue.write_buffer(&self.ui_buf, 0, bytemuck::cast_slice(&verts));
         }
 
+        // Upload des dynamiques (une seule fois, partagé par toutes les passes).
+        let dyn_plan = self.upload_dynamics(dynamics);
+
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("frame"),
         });
 
-        // 1) Monde -> offscreen.
-        {
+        // 1) Pré-pass profondeur + passe RT + monde (RT activé), ou monde seul.
+        if rt_on {
+            {
+                let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("prepass-depth"),
+                    color_attachments: &[],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &self.depth_view,
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(1.0),
+                            store: wgpu::StoreOp::Store,
+                        }),
+                        stencil_ops: None,
+                    }),
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                let mut pass = pass.forget_lifetime();
+                self.draw_instances_pass(&mut pass, statics, &dyn_plan, &self.prepass_pipeline);
+            }
+            {
+                let rt0_att = wgpu::RenderPassColorAttachment {
+                    view: &self.rt0_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                };
+                let rt1_att = wgpu::RenderPassColorAttachment {
+                    view: &self.rt1_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                };
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("rt-pass"),
+                    color_attachments: &[Some(rt0_att), Some(rt1_att)],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                pass.set_pipeline(&self.rt_pipeline);
+                pass.set_bind_group(0, &self.rt_bind, &[]);
+                pass.draw(0..3, 0..1);
+            }
+            {
+                let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("world-pass-rt"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &self.offscreen_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color {
+                                r: 0.004,
+                                g: 0.005,
+                                b: 0.008,
+                                a: 1.0,
+                            }),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &self.depth_view,
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        }),
+                        stencil_ops: None,
+                    }),
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                let mut pass = pass.forget_lifetime();
+                self.draw_instances_pass(&mut pass, statics, &dyn_plan, &self.world_pipeline_rt);
+            }
+        } else {
             let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("world-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -763,7 +1202,7 @@ impl Renderer {
             });
             // 'pass borrow self...' : étendre la durée de vie via transmute sûr ici
             let mut pass = pass.forget_lifetime();
-            self.draw_instances_pass(&mut pass, statics, dynamics);
+            self.draw_instances_pass(&mut pass, statics, &dyn_plan, &self.world_pipeline);
         }
 
         // 2) Post-process -> surface.

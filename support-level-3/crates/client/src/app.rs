@@ -71,10 +71,13 @@ pub struct App {
     audio: Option<Audio>,
     map: Option<&'static MapData>,
     players: Vec<LobbyPlayer>,
+    /// Vrai si aucun fichier de config n'existait (1er lancement : auto-config RT).
+    fresh_config: bool,
 }
 
 impl App {
     fn new() -> App {
+        let fresh_config = !std::path::Path::new("sl3_config.json").exists();
         let config = Config::load();
         let lang = Lang::from_str(&config.lang);
         let audio = Audio::new(config.volume);
@@ -97,6 +100,21 @@ impl App {
             audio,
             map: None,
             players: Vec::new(),
+            fresh_config,
+        }
+    }
+
+    /// Cycle le mode ray tracing (off -> qualité -> ultra), applique et persiste.
+    fn cycle_rt_mode(&mut self) -> &'static str {
+        self.config.rt_mode = (self.config.rt_mode + 1) % 3;
+        self.config.save();
+        if let Some(r) = self.renderer.as_mut() {
+            r.set_rt_mode(self.config.rt_mode);
+        }
+        match self.config.rt_mode {
+            1 => t(self.lang, RT_QUAL),
+            2 => t(self.lang, RT_ULTRA),
+            _ => t(self.lang, RT_OFF),
         }
     }
 
@@ -207,7 +225,7 @@ impl App {
             ServerMsg::GameStarted { your_id, spawn, snapshot } => {
                 let map: &'static MapData = Box::leak(Box::new(MapData::parse()));
                 self.map = Some(map);
-                if let Some(r) = &self.renderer {
+                if let Some(r) = self.renderer.as_mut() {
                     let mut g = Game::new(map, your_id, spawn, r);
                     g.apply_snapshot(snapshot);
                     self.game = Some(Box::new(g));
@@ -335,6 +353,12 @@ impl App {
                 }
                 KeyCode::KeyE if !self.paused => {
                     self.interact_pressed();
+                }
+                KeyCode::F5 => {
+                    let label = self.cycle_rt_mode();
+                    if let Some(g) = self.game.as_mut() {
+                        g.add_feed(format!("{} : {}", t(self.lang, RT_TOAST), label));
+                    }
                 }
                 _ => {}
             }
@@ -505,6 +529,9 @@ impl App {
                         }
                     }
                 }
+                KeyCode::KeyT => {
+                    let _ = self.cycle_rt_mode();
+                }
                 KeyCode::ArrowLeft => {
                     self.config.sensitivity = (self.config.sensitivity - 0.1).max(0.2);
                     self.config.save();
@@ -561,7 +588,13 @@ impl App {
             Mode::GameOver { .. } => 3,
         };
 
-        let mut world_data: Option<(crate::gpu::WorldUniform, [f32; 4], Vec<(String, Vec<crate::gpu::InstanceData>)>)> = None;
+        let mut world_data: Option<(
+            crate::gpu::WorldUniform,
+            [f32; 4],
+            Vec<(String, Vec<crate::gpu::InstanceData>)>,
+            [[f32; 4]; 4],
+            Vec<crate::gpu::rtscene::GpuAabb>,
+        )> = None;
 
         match tag {
             0 => {
@@ -580,7 +613,7 @@ impl App {
             }
             2 => {
                 let Some(tx) = self.net.as_ref().map(|n| n.tx.clone()) else { return };
-                let (wu, post, dyns, fear) = {
+                let (wu, post, dyns, fear, inv_vp, rt_boxes) = {
                     let Some(g) = self.game.as_mut() else { return };
                     let local_sfx = g.update(dt, &self.keys, &tx);
                     if let Some(a) = self.audio.as_ref() {
@@ -590,8 +623,13 @@ impl App {
                     }
                     let dyns = g.dynamics();
                     let wu = g.world_uniform(w / h);
+                    let inv_vp = g.inv_view_proj(w / h);
+                    let rt_boxes = match self.renderer.as_ref() {
+                        Some(r) => g.rt_dynamic_boxes(&r.models),
+                        None => Vec::new(),
+                    };
                     let post = g.post_params();
-                    (wu, post, dyns, g.fear)
+                    (wu, post, dyns, g.fear, inv_vp, rt_boxes)
                 };
                 if let Some(a) = self.audio.as_ref() {
                     a.set_loop_volume("whisper", fear * 0.6);
@@ -599,10 +637,11 @@ impl App {
                 if let Some(g) = self.game.as_ref() {
                     hud::draw(&mut ui_ops, g, &font, self.lang, (w, h));
                 }
-                // Ligne perf (haut-droite) : FPS + échelle de rendu effective.
+                // Ligne perf (haut-droite) : FPS + échelle de rendu + indicateur RT.
                 let fps = (1.0 / self.ema_frame.max(1e-4)) as u32;
                 let pct = (self.renderer.as_ref().unwrap().render_scale() * 100.0).round() as u32;
-                let perf = format!("{fps} FPS · rendu {pct}%");
+                let rt_tag = if self.config.rt_mode > 0 { " · RT" } else { "" };
+                let perf = format!("{fps} FPS · rendu {pct}%{rt_tag}");
                 let tw = crate::gpu::ui::text_width(&font, &perf, 13.0);
                 ui_ops.push(UiOp::text(w - tw - 12.0, 10.0, 13.0, [0.62, 0.68, 0.62, 0.75], &perf));
                 if self.paused {
@@ -610,7 +649,7 @@ impl App {
                     draw_center(&mut ui_ops, &font, t(self.lang, RESUME_HINT), 18.0, DIM_C, (w, h * 0.42 + 50.0));
                     draw_center(&mut ui_ops, &font, t(self.lang, QUIT_HINT), 18.0, DIM_C, (w, h * 0.42 + 78.0));
                 }
-                world_data = Some((wu, post, dyns));
+                world_data = Some((wu, post, dyns, inv_vp, rt_boxes));
             }
             _ => {
                 let (win, time, servers, escaped) = match &self.mode {
@@ -634,20 +673,26 @@ impl App {
 
         // Rendu final.
         match world_data {
-            Some((wu, post, dyns)) => {
+            Some((wu, post, dyns, inv_vp, rt_boxes)) => {
                 let statics: &crate::gpu::StaticBatches = match self.game.as_ref() {
                     Some(g) => &g.statics,
                     None => empty_statics(),
                 };
-                let _ = self
-                    .renderer
-                    .as_mut()
-                    .unwrap()
-                    .render(&wu, statics, &dyns, &ui_ops, post);
+                let renderer = self.renderer.as_mut().unwrap();
+                let rt = if renderer.rt_mode > 0 {
+                    Some(crate::gpu::RtFrame {
+                        inv_vp,
+                        dyn_boxes: &rt_boxes,
+                    })
+                } else {
+                    None
+                };
+                let _ = renderer.render(&wu, rt, statics, &dyns, &ui_ops, post);
             }
             None => {
                 let _ = self.renderer.as_mut().unwrap().render(
                     &identity_uniform(),
+                    None,
                     empty_statics(),
                     &Vec::new(),
                     &ui_ops,
@@ -739,6 +784,19 @@ impl App {
                     20.0,
                     WHITE_C,
                     (w, h * 0.4 + 120.0),
+                );
+                let rt_label = match self.config.rt_mode {
+                    1 => t(self.lang, RT_QUAL),
+                    2 => t(self.lang, RT_ULTRA),
+                    _ => t(self.lang, RT_OFF),
+                };
+                draw_center(
+                    ui,
+                    &font,
+                    &format!("{} : {}", t(self.lang, OPT_RT), rt_label),
+                    16.0,
+                    if self.config.rt_mode > 0 { AMBER_C } else { WHITE_C },
+                    (w, h * 0.4 + 160.0),
                 );
                 draw_center(ui, &font, t(self.lang, BACK_HINT), 16.0, DIM_C, (w, h * 0.75));
             }
@@ -872,7 +930,13 @@ impl ApplicationHandler for App {
             .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 720.0));
         let window = el.create_window(attrs).expect("fenêtre");
         let window = Arc::new(window);
-        let renderer = Renderer::new(window.clone());
+        let mut renderer = Renderer::new(window.clone());
+        // 1er lancement sur un GPU ray tracing (RTX) : active le mode Qualité.
+        if self.fresh_config && renderer.adapter_name.to_lowercase().contains("rtx") {
+            self.config.rt_mode = 1;
+            self.config.save();
+        }
+        renderer.set_rt_mode(self.config.rt_mode);
         self.window = Some(window);
         self.renderer = Some(renderer);
     }

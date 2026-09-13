@@ -20,3 +20,7 @@ winit = "0.30"
 rodio = { version = "0.19", optional = true }
 bytemuck = { version = "1", features = ["derive"] }
 pollster = "0.3"
+
+[dev-dependencies]
+# Même version que wgpu 22 -> déjà compilé ; valide les shaders WGSL sans GPU.
+naga = { version = "22.1", features = ["wgsl-in"] }

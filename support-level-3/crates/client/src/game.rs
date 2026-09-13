@@ -9,6 +9,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Instant;
 
 use crate::gpu::{InstanceData, Renderer, MAX_LIGHTS};
+use crate::gpu::model::Model;
+use crate::gpu::rtscene::{self, GpuAabb};
 
 pub struct RemoteView {
     pub pos: Vec3,
@@ -44,9 +46,11 @@ pub struct Game {
 }
 
 impl Game {
-    pub fn new(map: &'static MapData, my_id: u8, spawn: Vec3, renderer: &Renderer) -> Game {
+    pub fn new(map: &'static MapData, my_id: u8, spawn: Vec3, renderer: &mut Renderer) -> Game {
         let insts = Self::build_static_list(map);
         let statics = renderer.build_static(&insts);
+        // Scène de ray tracing : murs fusionnés + mobilier (une fois par partie).
+        renderer.update_rt_statics(map, &insts);
         Game {
             map,
             my_id,
@@ -548,9 +552,61 @@ impl Game {
         out
     }
 
+    /// Matrice view_proj inversée (reconstruction de position dans la passe RT).
+    pub fn inv_view_proj(&self, aspect: f32) -> [[f32; 4]; 4] {
+        let eye = self.cam_eye();
+        let dir = self.forward();
+        let view = glam::Mat4::look_at_rh(eye, eye + dir, Vec3::Y);
+        let proj = glam::Mat4::perspective_rh(74f32.to_radians(), aspect, 0.05, 120.0);
+        (proj * view).inverse().to_cols_array_2d()
+    }
+
+    fn cam_eye(&self) -> Vec3 {
+        self.pos + Vec3::new(0.0, 1.62 + (self.bob_phase.sin() * 0.035), 0.0)
+    }
+
+    /// Boîtes d'occlusion dynamiques du frame : panneaux de porte (bloquent la
+    /// lumière quand fermés), baies serveurs, joueurs distants, l'Auditeur.
+    pub fn rt_dynamic_boxes(&self, models: &HashMap<String, Model>) -> Vec<GpuAabb> {
+        let mut out: Vec<GpuAabb> = Vec::new();
+        let trs = |pos: Vec3, yaw: f32| Mat4::from_translation(pos) * Mat4::from_rotation_y(yaw);
+        let push = |out: &mut Vec<GpuAabb>, name: &str, m: Mat4| {
+            if out.len() >= rtscene::MAX_RT_DYN_BOXES {
+                return;
+            }
+            if let Some(model) = models.get(name) {
+                out.push(rtscene::aabb_of_instance(&m, model.bounds.0, model.bounds.1));
+            }
+        };
+
+        // Panneaux de porte à leur position animée (coulissés quand ouverts).
+        for (i, d) in self.map.doors.iter().enumerate() {
+            let yaw = if d.vertical_passage { 0.0 } else { std::f32::consts::FRAC_PI_2 };
+            let slide = self.door_anim.get(i).copied().unwrap_or(0.0);
+            let off_local = Vec3::new(slide * 1.08, 0.0, 0.0);
+            let offset = Mat4::from_rotation_y(yaw).transform_vector3(off_local);
+            push(&mut out, "door_panel", trs(d.pos + offset, yaw));
+        }
+
+        if self.snap.is_some() {
+            // Baies serveurs.
+            for s in &self.map.servers {
+                push(&mut out, "server_bay", trs(s.pos, s.yaw));
+            }
+            // Joueurs distants + entité (boîte verticale approximative).
+            for p in self.remote.values() {
+                if p.state != PLAYER_OUT && p.state != PLAYER_ESCAPED {
+                    push(&mut out, "tech", trs(p.pos, p.yaw));
+                }
+            }
+            push(&mut out, "entity", trs(self.entity_vis.0, self.entity_vis.1));
+        }
+        out
+    }
+
     /// Uniform du monde (view_proj, lumières, torche, brouillard).
     pub fn world_uniform(&self, aspect: f32) -> WorldUniform {
-        let eye = self.pos + Vec3::new(0.0, 1.62 + (self.bob_phase.sin() * 0.035), 0.0);
+        let eye = self.cam_eye();
         let dir = self.forward();
         let view = glam::Mat4::look_at_rh(eye, eye + dir, Vec3::Y);
         let proj = glam::Mat4::perspective_rh(74f32.to_radians(), aspect, 0.05, 120.0);

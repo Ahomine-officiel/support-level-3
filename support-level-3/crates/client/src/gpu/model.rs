@@ -1,5 +1,6 @@
 //! Chargement des modèles GLTF (positions/normales/UV) -> buffers GPU par matériau.
 
+use glam::Vec3;
 use std::collections::HashMap;
 use std::path::Path;
 use wgpu::util::DeviceExt;
@@ -34,12 +35,16 @@ pub struct PartGpu {
 
 pub struct Model {
     pub parts: Vec<PartGpu>,
+    /// Boîte englobante locale (min, max) — utilisée par la scène de ray tracing.
+    pub bounds: (Vec3, Vec3),
 }
 
 pub fn load_model(device: &Device, path: &Path) -> Model {
     let (doc, buffers, _images) =
         gltf::import(path).unwrap_or_else(|e| panic!("GLTF invalide {}: {}", path.display(), e));
     let mut parts: Vec<PartGpu> = Vec::new();
+    let mut bmin = Vec3::splat(f32::MAX);
+    let mut bmax = Vec3::splat(f32::MIN);
 
     for node in doc.nodes() {
         let mesh = match node.mesh() {
@@ -64,6 +69,10 @@ pub fn load_model(device: &Device, path: &Path) -> Model {
                 .unwrap_or_else(|| (0..positions.len() as u32).collect());
             if positions.is_empty() {
                 continue;
+            }
+            for p in &positions {
+                bmin = bmin.min(Vec3::from(*p));
+                bmax = bmax.max(Vec3::from(*p));
             }
             let mat_name = prim
                 .material()
@@ -96,7 +105,12 @@ pub fn load_model(device: &Device, path: &Path) -> Model {
             });
         }
     }
-    Model { parts }
+    let bounds = if bmin.x.is_finite() {
+        (bmin, bmax)
+    } else {
+        (Vec3::splat(-0.1), Vec3::splat(0.1))
+    };
+    Model { parts, bounds }
 }
 
 /// Charge tous les modèles du dossier assets/models.

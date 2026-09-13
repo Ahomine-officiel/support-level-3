@@ -329,7 +329,7 @@ impl MapData {
                         m.solid[i] = true;
                     }
                     'o' => {
-                        m.props.push(("box".into(), pos, 0.0));
+                        m.props.push(("box_small".into(), pos, 0.0));
                         m.solid[i] = true;
                     }
                     'p' => {

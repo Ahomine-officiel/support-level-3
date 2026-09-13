@@ -11,6 +11,9 @@ pub struct Config {
     pub volume: f32,
     #[serde(default)]
     pub render_scale: f32,      // 0.0 = auto (DRS), sinon 0.45..1.0
+    /// Ray tracing : 0 = désactivé, 1 = qualité (ombres + AO), 2 = ultra (+ GI).
+    #[serde(default)]
+    pub rt_mode: u8,
 }
 
 impl Default for Config {
@@ -22,6 +25,7 @@ impl Default for Config {
             sensitivity: 1.0,
             volume: 0.8,
             render_scale: 0.0,
+            rt_mode: 0,
         }
     }
 }
@@ -29,7 +33,11 @@ impl Default for Config {
 impl Config {
     pub fn load() -> Config {
         match std::fs::read_to_string("sl3_config.json") {
-            Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
+            Ok(s) => {
+                let mut c: Config = serde_json::from_str(&s).unwrap_or_default();
+                c.rt_mode = c.rt_mode.min(2);
+                c
+            }
             Err(_) => Config::default(),
         }
     }
