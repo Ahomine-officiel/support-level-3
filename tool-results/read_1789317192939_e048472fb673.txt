@@ -1,0 +1,1153 @@
+     1→//! Application winit : menus bilingues, lobby, boucle de jeu, audio, réseau.
+     2→
+     3→use crate::audio::Audio;
+     4→use crate::config::Config;
+     5→use crate::game::Game;
+     6→use crate::gpu::{Renderer, UiOp};
+     7→use crate::hud;
+     8→use crate::lang::{t, Lang, *};
+     9→use crate::net::{NetEvent, NetHandle};
+    10→use glam::Vec3;
+    11→use sl3_shared::consts::*;
+    12→use sl3_shared::map::MapData;
+    13→use sl3_shared::protocol::*;
+    14→use std::collections::HashSet;
+    15→use std::sync::Arc;
+    16→use std::time::Instant;
+    17→use winit::application::ApplicationHandler;
+    18→use winit::dpi::PhysicalPosition;
+    19→use winit::event::{ElementState, WindowEvent};
+    20→use winit::event_loop::{ActiveEventLoop, EventLoop};
+    21→use winit::keyboard::{KeyCode, PhysicalKey};
+    22→use winit::window::Window;
+    23→
+    24→#[derive(Clone)]
+    25→enum MenuScreen {
+    26→    Main,
+    27→    AskHostAddr { buf: String },
+    28→    HostPassword { buf: String },
+    29→    AskJoinAddr { buf: String },
+    30→    AskCode { buf: String },
+    31→    AskPassword { code: String, buf: String },
+    32→    AskName { buf: String },
+    33→    Options,
+    34→}
+    35→
+    36→enum Mode {
+    37→    MainMenu(MenuScreen),
+    38→    Lobby { code: String, is_host: bool },
+    39→    Playing,
+    40→    GameOver { win: bool, time: f32, servers: u8, escaped: u8 },
+    41→}
+    42→
+    43→enum Pending {
+    44→    Create { password: String },
+    45→    Join { code: String, password: String },
+    46→}
+    47→
+    48→// ----- Autopilot (scénario de rendu automatisé, via SL3_AUTOPILOT) -----
+    49→
+    50→struct AutoStep {
+    51→    at: f64,
+    52→    act: AutoAct,
+    53→}
+    54→
+    55→enum AutoAct {
+    56→    Key(KeyCode),
+    57→    Shot(String),
+    58→    Yaw(f32),
+    59→    Exit,
+    60→}
+    61→
+    62→impl Clone for AutoAct {
+    63→    fn clone(&self) -> Self {
+    64→        match self {
+    65→            AutoAct::Key(k) => AutoAct::Key(*k),
+    66→            AutoAct::Shot(p) => AutoAct::Shot(p.clone()),
+    67→            AutoAct::Yaw(a) => AutoAct::Yaw(*a),
+    68→            AutoAct::Exit => AutoAct::Exit,
+    69→        }
+    70→    }
+    71→}
+    72→
+    73→struct Auto {
+    74→    t0: Instant,
+    75→    steps: Vec<AutoStep>,
+    76→    next: usize,
+    77→}
+    78→
+    79→fn parse_key(name: &str) -> Option<KeyCode> {
+    80→    Some(match name {
+    81→        "Enter" | "NumpadEnter" => KeyCode::Enter,
+    82→        "Digit1" => KeyCode::Digit1,
+    83→        "Digit2" => KeyCode::Digit2,
+    84→        "Digit3" => KeyCode::Digit3,
+    85→        "Space" => KeyCode::Space,
+    86→        "Escape" => KeyCode::Escape,
+    87→        "Backspace" => KeyCode::Backspace,
+    88→        "F5" => KeyCode::F5,
+    89→        "KeyF" => KeyCode::KeyF,
+    90→        "KeyE" => KeyCode::KeyE,
+    91→        _ => return None,
+    92→    })
+    93→}
+    94→
+    95→/// Format : « key Digit1@1.0 ; shot /tmp/x.png@3.0 ; exit@3.2 »
+    96→fn parse_autopilot(s: &str) -> Option<Auto> {
+    97→    let mut steps = Vec::new();
+    98→    for tok in s.split(';') {
+    99→        let tok = tok.trim();
+   100→        if tok.is_empty() {
+   101→            continue;
+   102→        }
+   103→        let (head, at) = tok.rsplit_once('@')?;
+   104→        let at: f64 = at.trim().parse().ok()?;
+   105→        let mut parts = head.splitn(2, ' ');
+   106→        let verb = parts.next().unwrap_or("").trim();
+   107→        let arg = parts.next().unwrap_or("").trim();
+   108→        let act = match verb {
+   109→            "key" => AutoAct::Key(parse_key(arg)?),
+   110→            "shot" => AutoAct::Shot(arg.to_string()),
+   111→            "yaw" => AutoAct::Yaw(arg.parse::<f32>().ok()?.to_radians()),
+   112→            "exit" => AutoAct::Exit,
+   113→            _ => return None,
+   114→        };
+   115→        steps.push(AutoStep { at, act });
+   116→    }
+   117→    steps.sort_by(|a, b| a.at.partial_cmp(&b.at).unwrap_or(std::cmp::Ordering::Equal));
+   118→    if steps.is_empty() {
+   119→        None
+   120→    } else {
+   121→        Some(Auto { t0: Instant::now(), steps, next: 0 })
+   122→    }
+   123→}
+   124→
+   125→const WHITE_C: [f32; 4] = [0.9, 0.92, 0.95, 1.0];
+   126→const DIM_C: [f32; 4] = [0.6, 0.63, 0.66, 0.85];
+   127→const GREEN_C: [f32; 4] = [0.5, 0.95, 0.55, 1.0];
+   128→const RED_C: [f32; 4] = [1.0, 0.4, 0.35, 1.0];
+   129→const AMBER_C: [f32; 4] = [1.0, 0.78, 0.3, 1.0];
+   130→
+   131→pub struct App {
+   132→    config: Config,
+   133→    lang: Lang,
+   134→    mode: Mode,
+   135→    net: Option<NetHandle>,
+   136→    pending: Option<Pending>,
+   137→    window: Option<Arc<Window>>,
+   138→    renderer: Option<Renderer>,
+   139→    game: Option<Box<Game>>,
+   140→    keys: HashSet<KeyCode>,
+   141→    cursor_locked: bool,
+   142→    paused: bool,
+   143→    last_frame: Instant,
+   144→    err: Option<(Instant, String)>,
+   145→    /// Moyenne glissante du temps de frame (pour la résolution dynamique).
+   146→    ema_frame: f32,
+   147→    last_scale_adj: Instant,
+   148→    audio: Option<Audio>,
+   149→    map: Option<&'static MapData>,
+   150→    players: Vec<LobbyPlayer>,
+   151→    /// Vrai si aucun fichier de config n'existait (1er lancement : auto-config RT).
+   152→    fresh_config: bool,
+   153→    /// Scénario autopilot (SL3_AUTOPILOT) : capture d'écrans automatisée.
+   154→    auto: Option<Auto>,
+   155→}
+   156→
+   157→impl App {
+   158→    fn new() -> App {
+   159→        let fresh_config = !Config::path().exists();
+   160→        let config = Config::load();
+   161→        let lang = Lang::from_str(&config.lang);
+   162→        let audio = Audio::new(config.volume);
+   163→        let auto = std::env::var("SL3_AUTOPILOT")
+   164→            .ok()
+   165→            .and_then(|s| parse_autopilot(&s));
+   166→        App {
+   167→            config,
+   168→            lang,
+   169→            mode: Mode::MainMenu(MenuScreen::Main),
+   170→            net: None,
+   171→            pending: None,
+   172→            window: None,
+   173→            renderer: None,
+   174→            game: None,
+   175→            keys: HashSet::new(),
+   176→            cursor_locked: false,
+   177→            paused: false,
+   178→            last_frame: Instant::now(),
+   179→            err: None,
+   180→            ema_frame: 1.0 / 60.0,
+   181→            last_scale_adj: Instant::now(),
+   182→            audio,
+   183→            map: None,
+   184→            players: Vec::new(),
+   185→            fresh_config,
+   186→            auto,
+   187→        }
+   188→    }
+   189→
+   190→    /// Cycle le mode ray tracing (off -> qualité -> ultra), applique et persiste.
+   191→    fn cycle_rt_mode(&mut self) -> &'static str {
+   192→        self.config.rt_mode = (self.config.rt_mode + 1) % 3;
+   193→        self.config.save();
+   194→        if let Some(r) = self.renderer.as_mut() {
+   195→            r.set_rt_mode(self.config.rt_mode);
+   196→        }
+   197→        match self.config.rt_mode {
+   198→            1 => t(self.lang, RT_QUAL),
+   199→            2 => t(self.lang, RT_ULTRA),
+   200→            _ => t(self.lang, RT_OFF),
+   201→        }
+   202→    }
+   203→
+   204→    fn show_err(&mut self, msg: String) {
+   205→        self.err = Some((Instant::now(), msg));
+   206→    }
+   207→
+   208→    fn connect(&mut self, addr: String, pending: Pending) {
+   209→        let lang_flag = if matches!(self.lang, Lang::En) { 1 } else { 0 };
+   210→        match crate::net::connect(&addr, self.config.name.clone(), lang_flag) {
+   211→            Ok(h) => {
+   212→                self.net = Some(h);
+   213→                self.pending = Some(pending);
+   214→            }
+   215→            Err(e) => self.show_err(format!("{} : {e}", t(self.lang, CONNECTING))),
+   216→        }
+   217→    }
+   218→
+   219→    fn back_to_menu(&mut self) {
+   220→        self.mode = Mode::MainMenu(MenuScreen::Main);
+   221→        self.paused = false;
+   222→        self.game = None;
+   223→        self.set_cursor_locked(false);
+   224→        if let Some(a) = self.audio.as_mut() {
+   225→            a.stop_loop("ambience");
+   226→            a.stop_loop("fluorescent");
+   227→            a.stop_loop("whisper");
+   228→        }
+   229→    }
+   230→
+   231→    fn leave_room(&mut self) {
+   232→        if let Some(n) = &self.net {
+   233→            n.send(ClientMsg::LeaveRoom);
+   234→        }
+   235→        self.back_to_menu();
+   236→    }
+   237→
+   238→    fn set_cursor_locked(&mut self, locked: bool) {
+   239→        self.cursor_locked = locked;
+   240→        if let Some(w) = &self.window {
+   241→            if locked {
+   242→                let _ = w
+   243→                    .set_cursor_grab(winit::window::CursorGrabMode::Locked)
+   244→                    .or_else(|_| w.set_cursor_grab(winit::window::CursorGrabMode::Confined));
+   245→                let _ = w.set_cursor_visible(false);
+   246→            } else {
+   247→                let _ = w.set_cursor_grab(winit::window::CursorGrabMode::None);
+   248→                let _ = w.set_cursor_visible(true);
+   249→            }
+   250→        }
+   251→    }
+   252→
+   253→    // ---------------- Réseau ----------------
+   254→
+   255→    fn handle_net_events(&mut self) {
+   256→        let events: Vec<NetEvent> = match &self.net {
+   257→            Some(n) => n.rx.try_iter().collect(),
+   258→            None => return,
+   259→        };
+   260→        for ev in events {
+   261→            match ev {
+   262→                NetEvent::Connected => {}
+   263→                NetEvent::Closed => {
+   264→                    if self.net.is_some() {
+   265→                        self.show_err(t(self.lang, E_ERR_CLOSED).to_string());
+   266→                        self.net = None;
+   267→                        self.back_to_menu();
+   268→                    }
+   269→                }
+   270→                NetEvent::Msg(msg) => self.handle_msg(msg),
+   271→            }
+   272→        }
+   273→    }
+   274→
+   275→    fn handle_msg(&mut self, msg: ServerMsg) {
+   276→        match msg {
+   277→            ServerMsg::Welcome { .. } => {
+   278→                if let Some(p) = self.pending.take() {
+   279→                    if let Some(n) = self.net.as_ref() {
+   280→                        match p {
+   281→                            Pending::Create { password } => n.send(ClientMsg::CreateRoom { password }),
+   282→                            Pending::Join { code, password } => {
+   283→                                n.send(ClientMsg::JoinRoom { code, password })
+   284→                            }
+   285→                        }
+   286→                    }
+   287→                }
+   288→            }
+   289→            ServerMsg::RoomCreated { .. } => {}
+   290→            ServerMsg::RoomJoined { code, players, is_host } => {
+   291→                self.mode = Mode::Lobby { code, is_host };
+   292→                self.players = players;
+   293→            }
+   294→            ServerMsg::LobbyUpdate { players } => self.players = players,
+   295→            ServerMsg::RoomError { msg_key } => {
+   296→                let key = match msg_key {
+   297→                    ERR_ROOM_NOT_FOUND => E_ERR_NOT_FOUND,
+   298→                    ERR_WRONG_PASSWORD => E_ERR_PASSWORD,
+   299→                    ERR_ROOM_FULL => E_ERR_FULL,
+   300→                    ERR_GAME_RUNNING => E_ERR_GAME,
+   301→                    ERR_NO_ROOM => E_ERR_NO_ROOM,
+   302→                    ERR_NOT_HOST => E_ERR_NOT_HOST,
+   303→                    _ => E_ERR_CLOSED,
+   304→                };
+   305→                self.show_err(t(self.lang, key).to_string());
+   306→                self.mode = Mode::MainMenu(MenuScreen::Main);
+   307→            }
+   308→            ServerMsg::GameStarted { your_id, spawn, snapshot } => {
+   309→                let map: &'static MapData = Box::leak(Box::new(MapData::parse()));
+   310→                self.map = Some(map);
+   311→                if let Some(r) = self.renderer.as_mut() {
+   312→                    let mut g = Game::new(map, your_id, spawn, r);
+   313→                    g.apply_snapshot(snapshot);
+   314→                    self.game = Some(Box::new(g));
+   315→                    self.mode = Mode::Playing;
+   316→                    self.paused = false;
+   317→                    self.set_cursor_locked(true);
+   318→                    if let Some(a) = self.audio.as_mut() {
+   319→                        a.start_loop("ambience", 0.5);
+   320→                        a.start_loop("fluorescent", 0.12);
+   321→                    }
+   322→                }
+   323→            }
+   324→            ServerMsg::Snapshot(snap) => {
+   325→                if let Some(g) = self.game.as_mut() {
+   326→                    g.apply_snapshot(snap);
+   327→                }
+   328→            }
+   329→            ServerMsg::Announcement { fr, en } => {
+   330→                if let Some(g) = self.game.as_mut() {
+   331→                    let msg = match self.lang {
+   332→                        Lang::Fr => fr,
+   333→                        Lang::En => en,
+   334→                    };
+   335→                    g.add_feed(msg);
+   336→                }
+   337→            }
+   338→            ServerMsg::Sfx { kind, pos } => self.play_sfx(kind, pos),
+   339→            ServerMsg::Event(_) => {}
+   340→            ServerMsg::GameOver { win, time, servers_fixed, escaped } => {
+   341→                self.mode = Mode::GameOver { win, time, servers: servers_fixed, escaped };
+   342→                self.set_cursor_locked(false);
+   343→                if let Some(a) = self.audio.as_mut() {
+   344→                    a.stop_loop("ambience");
+   345→                    a.stop_loop("fluorescent");
+   346→                    a.stop_loop("whisper");
+   347→                }
+   348→            }
+   349→            ServerMsg::Pong { .. } => {}
+   350→        }
+   351→    }
+   352→
+   353→    fn play_sfx(&mut self, kind: SfxKind, pos: Vec3) {
+   354→        let my = self.game.as_ref().map(|g| g.pos);
+   355→        let gain = match my {
+   356→            Some(my) => (1.0 - my.distance(pos) / 26.0).clamp(0.0, 1.0),
+   357→            None => 0.5,
+   358→        };
+   359→        if let Some(a) = &self.audio {
+   360→            let name = match kind {
+   361→                SfxKind::EntityStep => {
+   362→                    if rand_int(2) == 0 {
+   363→                        "entity_step1"
+   364→                    } else {
+   365→                        "entity_step2"
+   366→                    }
+   367→                }
+   368→                SfxKind::DoorOpen => "door_open",
+   369→                SfxKind::DoorSlam => "door_slam",
+   370→                SfxKind::Jumpscare => "jumpscare",
+   371→                SfxKind::Screech => "screech",
+   372→                SfxKind::RebootDone => "reboot_done",
+   373→                SfxKind::Pickup => "pickup",
+   374→                SfxKind::Stamp => "stamp",
+   375→                SfxKind::Battery => "battery",
+   376→                SfxKind::Blackout => "blackout",
+   377→                SfxKind::LightsOn => "lights_on",
+   378→                SfxKind::Breaker => "breaker",
+   379→                SfxKind::Caught => "caught",
+   380→                SfxKind::Whisper => "whisper",
+   381→            };
+   382→            let g2 = match kind {
+   383→                SfxKind::Jumpscare | SfxKind::Caught => 1.0,
+   384→                SfxKind::Whisper => gain * 0.5,
+   385→                _ => gain,
+   386→            };
+   387→            a.play(name, g2);
+   388→        }
+   389→    }
+   390→
+   391→    // ---------------- Clavier ----------------
+   392→
+   393→    fn on_key_pressed(&mut self, code: KeyCode, _el: &ActiveEventLoop) {
+   394→        if code == KeyCode::F12 {
+   395→            // Capture d'écran instantanée -> PNG à côté de l'exécutable.
+   396→            let ms = std::time::SystemTime::now()
+   397→                .duration_since(std::time::UNIX_EPOCH)
+   398→                .map(|d| d.as_millis())
+   399→                .unwrap_or(0);
+   400→            if let Some(r) = &mut self.renderer {
+   401→                r.capture_path = Some(std::path::PathBuf::from(format!("sl3_shot_{ms}.png")));
+   402→            }
+   403→            return;
+   404→        }
+   405→        if code == KeyCode::F1 {
+   406→            self.lang.toggle();
+   407→            self.config.lang = match self.lang {
+   408→                Lang::Fr => "fr".into(),
+   409→                Lang::En => "en".into(),
+   410→            };
+   411→            self.config.save();
+   412→            return;
+   413→        }
+   414→
+   415→        let in_menu = matches!(self.mode, Mode::MainMenu(_));
+   416→        let in_lobby = matches!(self.mode, Mode::Lobby { .. });
+   417→        let in_game = matches!(self.mode, Mode::Playing);
+   418→        let in_over = matches!(self.mode, Mode::GameOver { .. });
+   419→
+   420→        if in_menu {
+   421→            if let Mode::MainMenu(screen) = &self.mode {
+   422→                let screen = screen.clone();
+   423→                self.menu_key(&screen, code);
+   424→            }
+   425→        } else if in_lobby {
+   426→            match code {
+   427→                KeyCode::Space => {
+   428→                    if let Some(n) = &self.net {
+   429→                        n.send(ClientMsg::StartGame);
+   430→                    }
+   431→                }
+   432→                KeyCode::Escape => self.leave_room(),
+   433→                _ => {}
+   434→            }
+   435→        } else if in_game {
+   436→            match code {
+   437→                KeyCode::Escape => {
+   438→                    self.paused = !self.paused;
+   439→                    self.set_cursor_locked(!self.paused);
+   440→                }
+   441→                KeyCode::KeyF if !self.paused => {
+   442→                    if let Some(g) = self.game.as_mut() {
+   443→                        if g.battery > 0.0 {
+   444→                            g.light_on = !g.light_on;
+   445→                        }
+   446→                    }
+   447→                }
+   448→                KeyCode::KeyE if !self.paused => {
+   449→                    self.interact_pressed();
+   450→                }
+   451→                KeyCode::F5 => {
+   452→                    let label = self.cycle_rt_mode();
+   453→                    if let Some(g) = self.game.as_mut() {
+   454→                        g.add_feed(format!("{} : {}", t(self.lang, RT_TOAST), label));
+   455→                    }
+   456→                }
+   457→                _ => {}
+   458→            }
+   459→        } else if in_over && code == KeyCode::Enter {
+   460→            self.leave_room();
+   461→        }
+   462→    }
+   463→
+   464→    fn on_key_released(&mut self, code: KeyCode) {
+   465→        if code == KeyCode::KeyE && matches!(self.mode, Mode::Playing) {
+   466→            if let Some(n) = &self.net {
+   467→                n.send(ClientMsg::InteractStop);
+   468→            }
+   469→        }
+   470→    }
+   471→
+   472→    fn interact_pressed(&mut self) {
+   473→        let target = self.game.as_ref().and_then(|g| g.find_target().map(|(t, _)| t));
+   474→        if let (Some(n), Some(target)) = (self.net.as_ref(), target) {
+   475→            match target {
+   476→                Interactable::Door(id) => n.send(ClientMsg::DoorToggle { id }),
+   477→                other => n.send(ClientMsg::InteractStart { target: other }),
+   478→            }
+   479→        }
+   480→    }
+   481→
+   482→    // ---------------- Menus ----------------
+   483→
+   484→    fn menu_key(&mut self, screen: &MenuScreen, code: KeyCode) {
+   485→        let enter = code == KeyCode::Enter || code == KeyCode::NumpadEnter;
+   486→        let back = code == KeyCode::Escape;
+   487→        match screen {
+   488→            MenuScreen::Main => match code {
+   489→                KeyCode::Digit1 => {
+   490→                    self.mode = Mode::MainMenu(MenuScreen::AskHostAddr {
+   491→                        buf: self.config.host_default.clone(),
+   492→                    });
+   493→                }
+   494→                KeyCode::Digit2 => {
+   495→                    self.mode = Mode::MainMenu(MenuScreen::AskJoinAddr {
+   496→                        buf: self.config.host_default.clone(),
+   497→                    });
+   498→                }
+   499→                KeyCode::Digit3 => {
+   500→                    self.mode = Mode::MainMenu(MenuScreen::Options);
+   501→                }
+   502→                KeyCode::Escape => std::process::exit(0),
+   503→                _ => {}
+   504→            },
+   505→            MenuScreen::AskHostAddr { buf } => {
+   506→                if back {
+   507→                    self.back_to_menu();
+   508→                } else if code == KeyCode::Backspace {
+   509→                    let mut b = buf.clone();
+   510→                    b.pop();
+   511→                    self.mode = Mode::MainMenu(MenuScreen::AskHostAddr { buf: b });
+   512→                } else if enter {
+   513→                    self.config.host_default = buf.clone();
+   514→                    self.config.save();
+   515→                    self.mode = Mode::MainMenu(MenuScreen::HostPassword { buf: String::new() });
+   516→                }
+   517→            }
+   518→            MenuScreen::HostPassword { buf } => {
+   519→                if back {
+   520→                    self.back_to_menu();
+   521→                } else if code == KeyCode::Backspace {
+   522→                    let mut b = buf.clone();
+   523→                    b.pop();
+   524→                    self.mode = Mode::MainMenu(MenuScreen::HostPassword { buf: b });
+   525→                } else if enter {
+   526→                    let password = buf.clone();
+   527→                    let addr = self.config.host_default.clone();
+   528→                    self.connect(addr, Pending::Create { password });
+   529→                }
+   530→            }
+   531→            MenuScreen::AskJoinAddr { buf } => {
+   532→                if back {
+   533→                    self.back_to_menu();
+   534→                } else if code == KeyCode::Backspace {
+   535→                    let mut b = buf.clone();
+   536→                    b.pop();
+   537→                    self.mode = Mode::MainMenu(MenuScreen::AskJoinAddr { buf: b });
+   538→                } else if enter {
+   539→                    self.config.host_default = buf.clone();
+   540→                    self.config.save();
+   541→                    self.mode = Mode::MainMenu(MenuScreen::AskCode { buf: String::new() });
+   542→                }
+   543→            }
+   544→            MenuScreen::AskCode { buf } => {
+   545→                if back {
+   546→                    self.back_to_menu();
+   547→                } else if code == KeyCode::Backspace {
+   548→                    let mut b = buf.clone();
+   549→                    b.pop();
+   550→                    self.mode = Mode::MainMenu(MenuScreen::AskCode { buf: b });
+   551→                } else if enter {
+   552→                    let code_s = buf.trim().to_uppercase();
+   553→                    self.mode = Mode::MainMenu(MenuScreen::AskPassword {
+   554→                        code: code_s,
+   555→                        buf: String::new(),
+   556→                    });
+   557→                }
+   558→            }
+   559→            MenuScreen::AskPassword { code: room_code, buf } => {
+   560→                if back {
+   561→                    self.back_to_menu();
+   562→                } else if code == KeyCode::Backspace {
+   563→                    let mut b = buf.clone();
+   564→                    b.pop();
+   565→                    self.mode = Mode::MainMenu(MenuScreen::AskPassword {
+   566→                        code: room_code.clone(),
+   567→                        buf: b,
+   568→                    });
+   569→                } else if enter {
+   570→                    let password = buf.clone();
+   571→                    let code_s = room_code.clone();
+   572→                    let addr = self.config.host_default.clone();
+   573→                    self.connect(addr, Pending::Join { code: code_s, password });
+   574→                }
+   575→            }
+   576→            MenuScreen::AskName { buf } => {
+   577→                if back || enter {
+   578→                    if enter && !buf.trim().is_empty() {
+   579→                        self.config.name = buf.trim().chars().take(MAX_NAME_LEN).collect();
+   580→                        self.config.save();
+   581→                    }
+   582→                    self.mode = Mode::MainMenu(MenuScreen::Options);
+   583→                } else if code == KeyCode::Backspace {
+   584→                    let mut b = buf.clone();
+   585→                    b.pop();
+   586→                    self.mode = Mode::MainMenu(MenuScreen::AskName { buf: b });
+   587→                }
+   588→            }
+   589→            MenuScreen::Options => match code {
+   590→                KeyCode::Escape | KeyCode::Enter => {
+   591→                    self.mode = Mode::MainMenu(MenuScreen::Main);
+   592→                }
+   593→                KeyCode::KeyL => {
+   594→                    self.lang.toggle();
+   595→                    self.config.lang = match self.lang {
+   596→                        Lang::Fr => "fr".into(),
+   597→                        Lang::En => "en".into(),
+   598→                    };
+   599→                    self.config.save();
+   600→                }
+   601→                KeyCode::KeyN => {
+   602→                    self.mode = Mode::MainMenu(MenuScreen::AskName {
+   603→                        buf: self.config.name.clone(),
+   604→                    });
+   605→                }
+   606→                KeyCode::KeyR => {
+   607→                    // Cycle : auto -> 100 % -> 85 % -> 70 % -> 55 % -> auto.
+   608→                    self.config.render_scale = if self.config.render_scale <= 0.0 {
+   609→                        1.0
+   610→                    } else if (self.config.render_scale - 1.0).abs() < 1e-3 {
+   611→                        0.85
+   612→                    } else if (self.config.render_scale - 0.85).abs() < 1e-3 {
+   613→                        0.7
+   614→                    } else if (self.config.render_scale - 0.7).abs() < 1e-3 {
+   615→                        0.55
+   616→                    } else {
+   617→                        0.0
+   618→                    };
+   619→                    self.config.save();
+   620→                    if self.config.render_scale > 0.0 {
+   621→                        if let Some(r) = self.renderer.as_mut() {
+   622→                            r.set_render_scale(self.config.render_scale);
+   623→                        }
+   624→                    }
+   625→                }
+   626→                KeyCode::KeyT => {
+   627→                    let _ = self.cycle_rt_mode();
+   628→                }
+   629→                KeyCode::ArrowLeft => {
+   630→                    self.config.sensitivity = (self.config.sensitivity - 0.1).max(0.2);
+   631→                    self.config.save();
+   632→                }
+   633→                KeyCode::ArrowRight => {
+   634→                    self.config.sensitivity = (self.config.sensitivity + 0.1).min(3.0);
+   635→                    self.config.save();
+   636→                }
+   637→                _ => {}
+   638→            },
+   639→        }
+   640→    }
+   641→
+   642→    // ---------------- Rendu par frame ----------------
+   643→
+   644→    fn frame(&mut self) {
+   645→        if self.renderer.is_none() {
+   646→            return;
+   647→        }
+   648→        self.handle_net_events();
+   649→        let dt = self.last_frame.elapsed().as_secs_f32().min(0.1);
+   650→        self.last_frame = Instant::now();
+   651→
+   652→        // Résolution dynamique : adapte l'échelle de rendu au temps de frame réel
+   653→        // (cible ~60 fps ; plafond 1.0, plancher 0.45) — pensé pour iGPU / vieilles machines.
+   654→        self.ema_frame = self.ema_frame * 0.92 + dt * 0.08;
+   655→        if let Some(r) = self.renderer.as_mut() {
+   656→            if self.config.render_scale <= 0.0 {
+   657→                if self.last_scale_adj.elapsed().as_secs_f32() > 0.75 {
+   658→                    let cur = r.render_scale();
+   659→                    if self.ema_frame > 0.021 && cur > 0.45 {
+   660→                        r.set_render_scale(cur - 0.05);
+   661→                        self.last_scale_adj = Instant::now();
+   662→                    } else if self.ema_frame < 0.0145 && cur < 1.0 {
+   663→                        r.set_render_scale(cur + 0.05);
+   664→                        self.last_scale_adj = Instant::now();
+   665→                    }
+   666→                }
+   667→            } else {
+   668→                r.set_render_scale(self.config.render_scale);
+   669→            }
+   670→        }
+   671→        let (w, h) = {
+   672→            let s = self.renderer.as_ref().unwrap().size();
+   673→            (s.0 as f32, s.1 as f32)
+   674→        };
+   675→        let font = self.renderer.as_ref().unwrap().font.clone();
+   676→        let mut ui_ops: Vec<UiOp> = Vec::new();
+   677→
+   678→        let tag = match &self.mode {
+   679→            Mode::MainMenu(_) => 0,
+   680→            Mode::Lobby { .. } => 1,
+   681→            Mode::Playing => 2,
+   682→            Mode::GameOver { .. } => 3,
+   683→        };
+   684→
+   685→        let mut world_data: Option<(
+   686→            crate::gpu::WorldUniform,
+   687→            [f32; 4],
+   688→            Vec<(String, Vec<crate::gpu::InstanceData>)>,
+   689→            [[f32; 4]; 4],
+   690→            Vec<crate::gpu::rtscene::GpuAabb>,
+   691→        )> = None;
+   692→
+   693→        match tag {
+   694→            0 => {
+   695→                let screen = match &self.mode {
+   696→                    Mode::MainMenu(s) => s.clone(),
+   697→                    _ => MenuScreen::Main,
+   698→                };
+   699→                self.draw_menu(&mut ui_ops, &font, &screen, (w, h));
+   700→            }
+   701→            1 => {
+   702→                let (code, is_host) = match &self.mode {
+   703→                    Mode::Lobby { code, is_host } => (code.clone(), *is_host),
+   704→                    _ => (String::new(), false),
+   705→                };
+   706→                self.draw_lobby(&mut ui_ops, &font, &code, is_host, (w, h));
+   707→            }
+   708→            2 => {
+   709→                let Some(tx) = self.net.as_ref().map(|n| n.tx.clone()) else { return };
+   710→                let (wu, post, dyns, fear, inv_vp, rt_boxes) = {
+   711→                    let Some(g) = self.game.as_mut() else { return };
+   712→                    let local_sfx = g.update(dt, &self.keys, &tx);
+   713→                    if let Some(a) = self.audio.as_ref() {
+   714→                        for (name, gain) in local_sfx {
+   715→                            a.play(&name, gain);
+   716→                        }
+   717→                    }
+   718→                    let dyns = g.dynamics();
+   719→                    let wu = g.world_uniform(w / h);
+   720→                    let inv_vp = g.inv_view_proj(w / h);
+   721→                    let rt_boxes = match self.renderer.as_ref() {
+   722→                        Some(r) => g.rt_dynamic_boxes(&r.models),
+   723→                        None => Vec::new(),
+   724→                    };
+   725→                    let post = g.post_params();
+   726→                    (wu, post, dyns, g.fear, inv_vp, rt_boxes)
+   727→                };
+   728→                if let Some(a) = self.audio.as_ref() {
+   729→                    a.set_loop_volume("whisper", fear * 0.6);
+   730→                }
+   731→                if let Some(g) = self.game.as_ref() {
+   732→                    hud::draw(&mut ui_ops, g, &font, self.lang, (w, h));
+   733→                }
+   734→                // Ligne perf (haut-droite) : FPS + échelle de rendu + indicateur RT.
+   735→                let fps = (1.0 / self.ema_frame.max(1e-4)) as u32;
+   736→                let pct = (self.renderer.as_ref().unwrap().render_scale() * 100.0).round() as u32;
+   737→                let rt_tag = if self.config.rt_mode > 0 { " – RT" } else { "" };
+   738→                let perf = format!("{fps} FPS – rendu {pct}%{rt_tag}");
+   739→                let tw = crate::gpu::ui::text_width(&font, &perf, 13.0);
+   740→                ui_ops.push(UiOp::text(w - tw - 12.0, 10.0, 13.0, [0.62, 0.68, 0.62, 0.75], &perf));
+   741→                if self.paused {
+   742→                    draw_center(&mut ui_ops, &font, t(self.lang, PAUSED), 34.0, WHITE_C, (w, h * 0.42));
+   743→                    draw_center(&mut ui_ops, &font, t(self.lang, RESUME_HINT), 18.0, DIM_C, (w, h * 0.42 + 50.0));
+   744→                    draw_center(&mut ui_ops, &font, t(self.lang, QUIT_HINT), 18.0, DIM_C, (w, h * 0.42 + 78.0));
+   745→                }
+   746→                world_data = Some((wu, post, dyns, inv_vp, rt_boxes));
+   747→            }
+   748→            _ => {
+   749→                let (win, time, servers, escaped) = match &self.mode {
+   750→                    Mode::GameOver { win, time, servers, escaped } => (*win, *time, *servers, *escaped),
+   751→                    _ => (false, 0.0, 0, 0),
+   752→                };
+   753→                self.draw_gameover(&mut ui_ops, &font, win, time, servers, escaped, (w, h));
+   754→            }
+   755→        }
+   756→
+   757→        // Erreur temporaire.
+   758→        if let Some((at, msg)) = &self.err {
+   759→            let age = at.elapsed().as_secs_f32();
+   760→            if age < 4.0 {
+   761→                let alpha = 1.0 - age / 4.0;
+   762→                draw_center(&mut ui_ops, &font, msg, 18.0, [1.0, 0.45, 0.4, alpha], (w, h * 0.82));
+   763→            } else {
+   764→                self.err = None;
+   765→            }
+   766→        }
+   767→
+   768→        // Rendu final.
+   769→        match world_data {
+   770→            Some((wu, post, dyns, inv_vp, rt_boxes)) => {
+   771→                let statics: &crate::gpu::StaticBatches = match self.game.as_ref() {
+   772→                    Some(g) => &g.statics,
+   773→                    None => empty_statics(),
+   774→                };
+   775→                let renderer = self.renderer.as_mut().unwrap();
+   776→                let rt = if renderer.rt_mode > 0 {
+   777→                    Some(crate::gpu::RtFrame {
+   778→                        inv_vp,
+   779→                        dyn_boxes: &rt_boxes,
+   780→                    })
+   781→                } else {
+   782→                    None
+   783→                };
+   784→                let _ = renderer.render(&wu, rt, statics, &dyns, &ui_ops, post);
+   785→            }
+   786→            None => {
+   787→                let _ = self.renderer.as_mut().unwrap().render(
+   788→                    &identity_uniform(),
+   789→                    None,
+   790→                    empty_statics(),
+   791→                    &Vec::new(),
+   792→                    &ui_ops,
+   793→                    [0.0, 0.0, 0.0, 0.0],
+   794→                );
+   795→            }
+   796→        }
+   797→    }
+   798→
+   799→    fn draw_menu(&mut self, ui: &mut Vec<UiOp>, font: &crate::gpu::ui::FontData, screen: &MenuScreen, size: (f32, f32)) {
+   800→        let (w, h) = size;
+   801→        ui.push(UiOp::Rect { x: 0.0, y: 0.0, w, h, color: [0.012, 0.015, 0.024, 1.0] });
+   802→        ui.push(UiOp::Rect { x: 0.0, y: h * 0.5, w, h: h * 0.5, color: [0.02, 0.028, 0.04, 0.5] });
+   803→        draw_center(ui, &font, t(self.lang, TITLE), 44.0, [0.92, 0.55, 0.35, 1.0], (w, h * 0.16));
+   804→        draw_center(ui, &font, t(self.lang, SUBTITLE), 17.0, DIM_C, (w, h * 0.16 + 58.0));
+   805→        draw_center(ui, &font, t(self.lang, CONTROLS), 13.0, [0.55, 0.58, 0.6, 0.8], (w, h * 0.94));
+   806→
+   807→        match screen {
+   808→            MenuScreen::Main => {
+   809→                draw_center(ui, &font, t(self.lang, MENU_HOST), 24.0, WHITE_C, (w, h * 0.42));
+   810→                draw_center(ui, &font, t(self.lang, MENU_JOIN), 24.0, WHITE_C, (w, h * 0.42 + 44.0));
+   811→                draw_center(ui, &font, t(self.lang, MENU_OPTIONS), 24.0, WHITE_C, (w, h * 0.42 + 88.0));
+   812→                draw_center(ui, &font, t(self.lang, MENU_QUIT), 17.0, DIM_C, (w, h * 0.42 + 150.0));
+   813→            }
+   814→            MenuScreen::AskHostAddr { buf } => {
+   815→                draw_center(ui, &font, t(self.lang, ADDR_PROMPT), 20.0, WHITE_C, (w, h * 0.45));
+   816→                draw_center(ui, &font, &format!("{buf}_"), 22.0, AMBER_C, (w, h * 0.45 + 40.0));
+   817→                draw_center(ui, &font, &format!("{} – [Entrée] valider", t(self.lang, BACK_HINT)), 14.0, DIM_C, (w, h * 0.8));
+   818→            }
+   819→            MenuScreen::HostPassword { buf } => {
+   820→                let shown: String = buf.chars().map(|_| '*').collect();
+   821→                draw_center(ui, &font, t(self.lang, PASSWORD_PROMPT), 20.0, WHITE_C, (w, h * 0.45));
+   822→                draw_center(ui, &font, &format!("{shown}_"), 22.0, AMBER_C, (w, h * 0.45 + 40.0));
+   823→                draw_center(ui, &font, t(self.lang, BACK_HINT), 14.0, DIM_C, (w, h * 0.8));
+   824→            }
+   825→            MenuScreen::AskJoinAddr { buf } => {
+   826→                draw_center(ui, &font, t(self.lang, ADDR_PROMPT), 20.0, WHITE_C, (w, h * 0.45));
+   827→                draw_center(ui, &font, &format!("{buf}_"), 22.0, AMBER_C, (w, h * 0.45 + 40.0));
+   828→                draw_center(ui, &font, t(self.lang, BACK_HINT), 14.0, DIM_C, (w, h * 0.8));
+   829→            }
+   830→            MenuScreen::AskCode { buf } => {
+   831→                draw_center(ui, &font, t(self.lang, CODE_PROMPT), 20.0, WHITE_C, (w, h * 0.45));
+   832→                draw_center(ui, &font, &format!("{buf}_"), 26.0, AMBER_C, (w, h * 0.45 + 44.0));
+   833→                draw_center(ui, &font, t(self.lang, BACK_HINT), 14.0, DIM_C, (w, h * 0.8));
+   834→            }
+   835→            MenuScreen::AskPassword { code: room_code, buf } => {
+   836→                let shown: String = buf.chars().map(|_| '*').collect();
+   837→                draw_center(ui, &font, &format!("{} {room_code}", t(self.lang, LOBBY)), 18.0, DIM_C, (w, h * 0.4));
+   838→                draw_center(ui, &font, t(self.lang, PASSWORD_PROMPT), 20.0, WHITE_C, (w, h * 0.45));
+   839→                draw_center(ui, &font, &format!("{shown}_"), 22.0, AMBER_C, (w, h * 0.45 + 40.0));
+   840→                draw_center(ui, &font, t(self.lang, BACK_HINT), 14.0, DIM_C, (w, h * 0.8));
+   841→            }
+   842→            MenuScreen::AskName { buf } => {
+   843→                draw_center(ui, &font, t(self.lang, NAME_PROMPT), 20.0, WHITE_C, (w, h * 0.45));
+   844→                draw_center(ui, &font, &format!("{buf}_"), 22.0, AMBER_C, (w, h * 0.45 + 40.0));
+   845→            }
+   846→            MenuScreen::Options => {
+   847→                draw_center(ui, &font, t(self.lang, OPT_LANG), 20.0, WHITE_C, (w, h * 0.4));
+   848→                draw_center(
+   849→                    ui,
+   850→                    &font,
+   851→                    &format!("{} : {:.1}", t(self.lang, OPT_SENS), self.config.sensitivity),
+   852→                    20.0,
+   853→                    WHITE_C,
+   854→                    (w, h * 0.4 + 40.0),
+   855→                );
+   856→                draw_center(
+   857→                    ui,
+   858→                    &font,
+   859→                    &format!("{} : {}", t(self.lang, OPT_NAME), self.config.name),
+   860→                    20.0,
+   861→                    WHITE_C,
+   862→                    (w, h * 0.4 + 80.0),
+   863→                );
+   864→                let rs_label = if self.config.render_scale <= 0.0 {
+   865→                    let cur = self
+   866→                        .renderer
+   867→                        .as_ref()
+   868→                        .map(|r| r.render_scale())
+   869→                        .unwrap_or(1.0);
+   870→                    format!("auto ({:.0}%)", cur * 100.0)
+   871→                } else {
+   872→                    format!("{:.0}%", self.config.render_scale * 100.0)
+   873→                };
+   874→                draw_center(
+   875→                    ui,
+   876→                    &font,
+   877→                    &format!("{} : {}", t(self.lang, OPT_RENDER), rs_label),
+   878→                    20.0,
+   879→                    WHITE_C,
+   880→                    (w, h * 0.4 + 120.0),
+   881→                );
+   882→                let rt_label = match self.config.rt_mode {
+   883→                    1 => t(self.lang, RT_QUAL),
+   884→                    2 => t(self.lang, RT_ULTRA),
+   885→                    _ => t(self.lang, RT_OFF),
+   886→                };
+   887→                draw_center(
+   888→                    ui,
+   889→                    &font,
+   890→                    &format!("{} : {}", t(self.lang, OPT_RT), rt_label),
+   891→                    16.0,
+   892→                    if self.config.rt_mode > 0 { AMBER_C } else { WHITE_C },
+   893→                    (w, h * 0.4 + 160.0),
+   894→                );
+   895→                draw_center(ui, &font, t(self.lang, BACK_HINT), 16.0, DIM_C, (w, h * 0.75));
+   896→            }
+   897→        }
+   898→    }
+   899→
+   900→    fn draw_lobby(&mut self, ui: &mut Vec<UiOp>, font: &crate::gpu::ui::FontData, code: &str, is_host: bool, size: (f32, f32)) {
+   901→        let (w, h) = size;
+   902→        ui.push(UiOp::Rect { x: 0.0, y: 0.0, w, h, color: [0.012, 0.015, 0.024, 1.0] });
+   903→        draw_center(
+   904→            ui,
+   905→            &font,
+   906→            &format!("{} {code}", t(self.lang, LOBBY)),
+   907→            36.0,
+   908→            [0.5, 0.9, 0.6, 1.0],
+   909→            (w, h * 0.2),
+   910→        );
+   911→        let mut y = h * 0.35;
+   912→        let host_id = self.players.first().map(|p| p.id);
+   913→        for p in &self.players {
+   914→            let tag = if host_id == Some(p.id) {
+   915→                format!(" — {}", t(self.lang, HOST_OF))
+   916→            } else {
+   917→                String::new()
+   918→            };
+   919→            draw_center(ui, &font, &format!("{}{tag}", p.name), 22.0, WHITE_C, (w, y));
+   920→            y += 36.0;
+   921→        }
+   922→        if is_host {
+   923→            draw_center(ui, &font, t(self.lang, LOBBY_HOST), 22.0, AMBER_C, (w, h * 0.72));
+   924→        } else {
+   925→            draw_center(ui, &font, t(self.lang, LOBBY_WAIT), 22.0, DIM_C, (w, h * 0.72));
+   926→        }
+   927→        draw_center(ui, &font, t(self.lang, LEAVE_HINT), 15.0, DIM_C, (w, h * 0.85));
+   928→    }
+   929→
+   930→    fn draw_gameover(
+   931→        &mut self,
+   932→        ui: &mut Vec<UiOp>,
+   933→        font: &crate::gpu::ui::FontData,
+   934→        win: bool,
+   935→        time: f32,
+   936→        servers: u8,
+   937→        escaped: u8,
+   938→        size: (f32, f32),
+   939→    ) {
+   940→        let (w, h) = size;
+   941→        ui.push(UiOp::Rect {
+   942→            x: 0.0,
+   943→            y: 0.0,
+   944→            w,
+   945→            h,
+   946→            color: if win { [0.02, 0.05, 0.02, 1.0] } else { [0.06, 0.01, 0.01, 1.0] },
+   947→        });
+   948→        let title = if win { t(self.lang, WIN_TITLE) } else { t(self.lang, LOSE_TITLE) };
+   949→        let sub = if win { t(self.lang, WIN_SUB) } else { t(self.lang, LOSE_SUB) };
+   950→        let color = if win { GREEN_C } else { RED_C };
+   951→        draw_center(ui, &font, title, 42.0, color, (w, h * 0.3));
+   952→        draw_center(ui, &font, sub, 18.0, DIM_C, (w, h * 0.3 + 60.0));
+   953→        let mins = (time as u32) / 60;
+   954→        let secs = (time as u32) % 60;
+   955→        draw_center(
+   956→            ui,
+   957→            &font,
+   958→            &format!(
+   959→                "{} {mins:02}:{secs:02}   –   {} {servers}/6   –   {} {escaped}",
+   960→                t(self.lang, TIME),
+   961→                t(self.lang, SERVERS),
+   962→                t(self.lang, ESCAPED)
+   963→            ),
+   964→            20.0,
+   965→            WHITE_C,
+   966→            (w, h * 0.55),
+   967→        );
+   968→        draw_center(ui, &font, t(self.lang, AGAIN_HINT), 18.0, AMBER_C, (w, h * 0.75));
+   969→    }
+   970→}
+   971→
+   972→fn draw_center(
+   973→    ui: &mut Vec<UiOp>,
+   974→    font: &crate::gpu::ui::FontData,
+   975→    s: &str,
+   976→    size: f32,
+   977→    color: [f32; 4],
+   978→    (w, y): (f32, f32),
+   979→) {
+   980→    let tw = crate::gpu::ui::text_width(font, s, size);
+   981→    ui.push(UiOp::text(w / 2.0 - tw / 2.0, y, size, color, s));
+   982→}
+   983→
+   984→fn identity_uniform() -> crate::gpu::WorldUniform {
+   985→    crate::gpu::WorldUniform {
+   986→        view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
+   987→        cam_pos: [0.0; 4],
+   988→        light_pos: [[0.0; 4]; crate::gpu::MAX_LIGHTS],
+   989→        light_col: [[0.0; 4]; crate::gpu::MAX_LIGHTS],
+   990→        flash_pos: [0.0; 4],
+   991→        flash_dir: [0.0; 4],
+   992→        misc: [0.0; 4],
+   993→        flash_col: [0.0; 4],
+   994→    }
+   995→}
+   996→
+   997→fn empty_statics() -> &'static crate::gpu::StaticBatches {
+   998→    static EMPTY: std::sync::OnceLock<crate::gpu::StaticBatches> = std::sync::OnceLock::new();
+   999→    EMPTY.get_or_init(|| crate::gpu::StaticBatches { batches: Vec::new(), total_instances: 0 })
+  1000→}
+  1001→
+  1002→fn rand_int(n: u32) -> u32 {
+  1003→    use std::cell::Cell;
+  1004→    thread_local! {
+  1005→        static S: Cell<u32> = Cell::new(0x9e3779b9);
+  1006→    }
+  1007→    S.with(|s| {
+  1008→        let mut x = s.get();
+  1009→        x ^= x << 13;
+  1010→        x ^= x >> 17;
+  1011→        x ^= x << 5;
+  1012→        s.set(x);
+  1013→        x % n.max(1)
+  1014→    })
+  1015→}
+  1016→
+  1017→impl App {
+  1018→    fn pump_autopilot(&mut self, el: &ActiveEventLoop) {
+  1019→        let mut due: Vec<AutoAct> = Vec::new();
+  1020→        if let Some(auto) = self.auto.as_mut() {
+  1021→            let t = auto.t0.elapsed().as_secs_f64();
+  1022→            while auto.next < auto.steps.len() && auto.steps[auto.next].at <= t {
+  1023→                due.push(auto.steps[auto.next].act.clone());
+  1024→                auto.next += 1;
+  1025→            }
+  1026→        } else {
+  1027→            return;
+  1028→        }
+  1029→        for act in due {
+  1030→            match act {
+  1031→                AutoAct::Key(c) => {
+  1032→                    self.keys.insert(c);
+  1033→                    self.on_key_pressed(c, el);
+  1034→                    self.keys.remove(&c);
+  1035→                    self.on_key_released(c);
+  1036→                }
+  1037→                AutoAct::Shot(p) => {
+  1038→                    if let Some(r) = self.renderer.as_mut() {
+  1039→                        r.capture_path = Some(std::path::PathBuf::from(&p));
+  1040→                        println!("[autopilot] capture -> {p}");
+  1041→                    }
+  1042→                }
+  1043→                AutoAct::Yaw(a) => {
+  1044→                    if let Some(g) = self.game.as_mut() {
+  1045→                        g.yaw += a;
+  1046→                    }
+  1047→                }
+  1048→                AutoAct::Exit => {
+  1049→                    self.config.save();
+  1050→                    println!("[autopilot] fin");
+  1051→                    el.exit();
+  1052→                }
+  1053→            }
+  1054→        }
+  1055→    }
+  1056→}
+  1057→
+  1058→impl ApplicationHandler for App {
+  1059→    fn resumed(&mut self, el: &ActiveEventLoop) {
+  1060→        if self.window.is_some() {
+  1061→            return;
+  1062→        }
+  1063→        let attrs = Window::default_attributes()
+  1064→            .with_title("SUPPORT LEVEL -3")
+  1065→            .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 720.0));
+  1066→        let window = el.create_window(attrs).expect("fenêtre");
+  1067→        let window = Arc::new(window);
+  1068→        let mut renderer = Renderer::new(window.clone());
+  1069→        // 1er lancement sur un GPU ray tracing (RTX) : active le mode Qualité.
+  1070→        if self.fresh_config && renderer.adapter_name.to_lowercase().contains("rtx") {
+  1071→            self.config.rt_mode = 1;
+  1072→            self.config.save();
+  1073→        }
+  1074→        renderer.set_rt_mode(self.config.rt_mode);
+  1075→        self.window = Some(window);
+  1076→        self.renderer = Some(renderer);
+  1077→    }
+  1078→
+  1079→    fn window_event(&mut self, el: &ActiveEventLoop, _id: winit::window::WindowId, event: WindowEvent) {
+  1080→        match event {
+  1081→            WindowEvent::CloseRequested => {
+  1082→                self.config.save();
+  1083→                el.exit();
+  1084→            }
+  1085→            WindowEvent::Resized(size) => {
+  1086→                if let Some(r) = &mut self.renderer {
+  1087→                    r.resize(size.width, size.height);
+  1088→                }
+  1089→            }
+  1090→            WindowEvent::CursorMoved { position, .. } => {
+  1091→                if self.cursor_locked {
+  1092→                    if let (Some(win), Some(r)) = (&self.window, &self.renderer) {
+  1093→                        let (w, h) = r.size();
+  1094→                        let cx = w as f64 / 2.0;
+  1095→                        let cy = h as f64 / 2.0;
+  1096→                        let dx = position.x - cx;
+  1097→                        let dy = position.y - cy;
+  1098→                        if dx.abs() < 600.0 && dy.abs() < 600.0 {
+  1099→                            if let Some(g) = self.game.as_mut() {
+  1100→                                let sens = self.config.sensitivity;
+  1101→                                g.yaw += (dx as f32) * 0.0022 * sens;
+  1102→                                g.pitch -= (dy as f32) * 0.0022 * sens;
+  1103→                                g.pitch = g.pitch.clamp(-1.45, 1.45);
+  1104→                            }
+  1105→                        }
+  1106→                        if let Ok(op) = win.outer_position() {
+  1107→                            let _ = win.set_cursor_position(PhysicalPosition::new(
+  1108→                                op.x + cx as i32,
+  1109→                                op.y + cy as i32,
+  1110→                            ));
+  1111→                        }
+  1112→                    }
+  1113→                }
+  1114→            }
+  1115→            WindowEvent::KeyboardInput { event, .. } => {
+  1116→                let code = match event.physical_key {
+  1117→                    PhysicalKey::Code(c) => c,
+  1118→                    _ => return,
+  1119→                };
+  1120→                match event.state {
+  1121→                    ElementState::Pressed => {
+  1122→                        if self.keys.insert(code) {
+  1123→                            self.on_key_pressed(code, el);
+  1124→                        }
+  1125→                    }
+  1126→                    ElementState::Released => {
+  1127→                        self.keys.remove(&code);
+  1128→                        self.on_key_released(code);
+  1129→                    }
+  1130→                }
+  1131→            }
+  1132→            WindowEvent::RedrawRequested => {
+  1133→                self.frame();
+  1134→            }
+  1135→            _ => {}
+  1136→        }
+  1137→    }
+  1138→
+  1139→    fn about_to_wait(&mut self, el: &ActiveEventLoop) {
+  1140→        self.handle_net_events();
+  1141→        self.pump_autopilot(el);
+  1142→        if let Some(win) = &self.window {
+  1143→            win.request_redraw();
+  1144→        }
+  1145→    }
+  1146→}
+  1147→
+  1148→pub fn run() {
+  1149→    let event_loop = EventLoop::builder().build().expect("event loop");
+  1150→    let mut app = App::new();
+  1151→    let _ = event_loop.run_app(&mut app);
+  1152→}
+  1153→
