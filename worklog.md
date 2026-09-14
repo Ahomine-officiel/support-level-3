@@ -121,3 +121,24 @@ Stage Summary:
 - DLSS : bouton présent, activé sur RTX uniquement (vérif nom d'adaptateur), repli transparent sur FSR 3 ailleurs — le SDK NVIDIA propriétaire n'étant pas intégrable, c'est notre reconstruction temporelle équivalente qui tourne derrière (documenté dans le README).
 - Tous les menus sont désormais cliquables à la souris (menu, options, lobby, pause, fin de partie) — demande « pk c pas des boutons » satisfaite ; bug d'accumulation des boutons fantômes trouvé et corrigé grâce aux clics autopilot.
 - Vérifié : cargo build debug+release 0 warning, cargo test 15/15, captures lavapipe relues (menu/options/jeu natif vs FSR 3) ; sur la RTX 2060 de l'utilisateur, FSR 3 Qualité rendra la scène en interne à 67 % avec reconstruction temporelle complète.
+
+---
+Task ID: 6-b
+Agent: Super Z (agent principal)
+Task: Reprise post-réinitialisation de l'environnement — répondre à « T'as des pbrs? Et pas de frame gen, only upscaling » : re-vérifier FSR 3/DLSS/boutons de bout en bout, confirmer zéro frame generation, corrections cosmétiques.
+
+Work Log:
+- Environnement reconstruit (session réinitialisée) : rustup 1.98.1 + ALSA re-extraits ; lavapipe (mesa-vulkan-drivers 25.0.7) + libxkbcommon-x11/libxcb-xkb/libxcb-cursor + xauth re-extraits, ICD lvp_icd.json patché en chemin absolu, Xvfb :99 1280x720.
+- Vérification code : shaders/upscale.wgsl (port FSR 2/3 : mv -> dilate -> accum Lanczos/rectification YCoCg -> RCAS), config upscaler/upscale_quality, système HotBtn/BtnAction — tout en place conformément au Task 6.
+- cargo build --release 0 warning ; cargo test --release 15/15.
+- ERREUR DE TEST corrigée : le client n'a PAS de flag --autopilot (ignoré silencieusement -> premier run sans captures, kill au timeout) ; l'autopilot se passe par la variable d'environnement SL3_AUTOPILOT. Relance correcte.
+- VALIDATION CLIC COMPLÈTE (autopilot, captures relues) : clic (640,422)->OptionsMenu, (702,291)->Ups(1)=FSR 3, (702,339)->UpsQ(1)=Équilibré — logs [sl3-debug] confirment les bons boutons touchés ; sl3_config.json persisté upscaler=1, upscale_quality=1.
+- 2 DÉFAUTS COSMÉTIQUES trouvés sur captures et corrigés (app.rs) : (1) voile Options alpha 0.94 -> 1.0 (le titre « SUPPORT NIVEAU -3 » et le sous-titre transperçaient le panneau) ; (2) rangée Ray tracing décalée de +20 px quand la note d'upscaling est affichée (la note « Reconstruction temporelle… » passait sous les boutons). Re-capture : panneau propre, note intégralement lisible.
+- VALIDATION EN JEU réelle : serveur --port 27070 --bots 2 (crée un salon de test), client autopilot : clic Héberger -> Enter -> Enter (mdp vide) -> clic Démarrer la partie (640,554) -> en jeu. Tag perf « 10 FPS - rendu 26% – FSR 3 Équilibré » (DRS+upscale combinés sur lavapipe), F6 -> « rendu 45% » + indicateur « Upscaling : Natif », F6 -> retour FSR 3, yaw 60° : couloir torche + fog reconstruits sans artefact visible. Poids PNG natif 2,8 Mo vs FSR 3 1,6 Mo (deux chemins de rendu distincts confirmés).
+- FRAME GENERATION : confirmé ABSENT — le pipeline est exclusivement de l'upscaling (pas de passe d'interpolation, pas d'optical flow) ; README documente déjà la limite.
+- Zip re-packagé : /home/z/my-project/download/support-level-3.zip (15 Mo, app.rs corrigé + binaires release du jour).
+
+Stage Summary:
+- Aucun problème bloquant (« T'as des pbrs? » -> non) ; FSR 3 = upscaling temporel UNIQUEMENT, sans frame generation (demande utilisateur respectée).
+- 2 retouches UI (voile opaque, note non chevauchée) validées par captures ; boutons clics souris re-testés de bout en bout avec persistance config ; partie réelle FSR 3 vs Natif re-validée sous lavapipe.
+- Livrable à jour : /home/z/my-project/download/support-level-3.zip.

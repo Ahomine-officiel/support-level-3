@@ -1114,7 +1114,7 @@ impl App {
             }
             MenuScreen::Options => {
                 // Voile : masque le titre de fond pour la lisibilité du panneau.
-                ui.push(UiOp::Rect { x: 0.0, y: 0.0, w, h, color: [0.012, 0.015, 0.024, 0.94] });
+                ui.push(UiOp::Rect { x: 0.0, y: 0.0, w, h, color: [0.012, 0.015, 0.024, 1.0] });
                 draw_center(ui, &font, t(self.lang, BTN_OPTIONS), 30.0, WHITE_C, (w, h * 0.10));
 
                 // Layout adaptatif : sous 620 px de haut, rangées compactes.
@@ -1196,8 +1196,9 @@ impl App {
                     }
                 }
 
-                // Ray tracing.
+                // Ray tracing (décalé sous la note d'upscaling quand elle est affichée).
                 let row_y = if self.config.upscaler > 0 { top + gap * 5.0 } else { top + gap * 4.0 };
+                let row_y = row_y + if self.config.upscaler > 0 && !compact { 20.0 } else { 0.0 };
                 ui.push(UiOp::text(w / 2.0 - 320.0, row_y + bh / 2.0 - 8.0, 17.0, DIM_C, &t(self.lang, OPT_RT).replace("[T] ", "")));
                 let rt_items: [(u8, &str); 3] = [
                     (0, t(self.lang, RT_OFF)),
