@@ -66,7 +66,21 @@ pub const SRV_BROKEN: u8 = 0;
 pub const SRV_FIXING: u8 = 1;
 pub const SRV_ONLINE: u8 = 2;
 
-/// Blackout (événement).
+/// Blackout (événement). Les bornes sont surchargeables pour les tests/QA via
+/// SL3_BLACKOUT_MIN / SL3_BLACKOUT_MAX (secondes) — pratique pour valider le
+/// rendu RT sans coupure pendant les captures automatisées.
 pub const BLACKOUT_INTERVAL_MIN: f32 = 55.0;
 pub const BLACKOUT_INTERVAL_MAX: f32 = 110.0;
+
+pub fn blackout_bounds() -> (f32, f32) {
+    let min = std::env::var("SL3_BLACKOUT_MIN")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .unwrap_or(BLACKOUT_INTERVAL_MIN);
+    let max = std::env::var("SL3_BLACKOUT_MAX")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .unwrap_or(BLACKOUT_INTERVAL_MAX);
+    (min, max.max(min))
+}
 pub const BLACKOUT_DURATION: f32 = 22.0;

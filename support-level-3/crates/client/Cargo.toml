@@ -9,6 +9,7 @@ audio = ["dep:rodio"]
 
 [dependencies]
 sl3-shared = { path = "../shared" }
+sl3-server = { path = "../server" }
 serde = { workspace = true }
 bincode = { workspace = true }
 glam = { workspace = true }

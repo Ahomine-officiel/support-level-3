@@ -78,7 +78,9 @@ fn fs(in: VSOut) -> @location(0) vec4<f32> {
     let shf = rt0.b;
     let gi = rt1.rgb;
 
-    var light = vec3<f32>(0.035, 0.04, 0.055) * ao;
+    // Plancher de lisibilité : l'AO ne tue plus l'ambiance totale (RT dans le
+    // noir = avant « on voit rien », l'ambiance est simplement atténuée).
+    var light = vec3<f32>(0.035, 0.04, 0.055) * mix(1.0, ao, 0.6);
     let nl_count = u32(u.misc.x);
     for (var i: u32 = 0u; i < 24u; i = i + 1u) {
         if (i >= nl_count) { break; }

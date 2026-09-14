@@ -1495,7 +1495,12 @@ impl Renderer {
                     world_uniform.misc[0],
                     1.6,
                 ],
-                misc: [if self.rt_mode >= 2 { 0.55 } else { 0.0 }, 0.35, 0.0, 0.0],
+                misc: [
+                    if self.rt_mode >= 2 { 0.55 } else { 0.0 },
+                    0.35,
+                    if self.rt_mode >= 2 { 3.0 } else { 1.0 }, // échantillons AO
+                    0.0,
+                ],
             };
             self.queue.write_buffer(&self.rt_params_buf, 0, bytemuck::bytes_of(&params));
             let mut boxes: Vec<rtscene::GpuAabb> = f

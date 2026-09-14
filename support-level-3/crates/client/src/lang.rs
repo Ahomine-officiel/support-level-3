@@ -112,6 +112,11 @@ pub const OPT_RESOLUTION: usize = 85;
 pub const RS_AUTO: usize = 86;
 pub const UP_TOAST: usize = 87;
 pub const UP_NOTE: usize = 88;
+pub const HOST_SETUP: usize = 89;
+pub const BOTS_LABEL: usize = 90;
+pub const LOCAL_NOTE: usize = 91;
+pub const E_LOCAL_SERVER: usize = 92;
+pub const BOTS_SUB: usize = 93;
 
 pub fn t(lang: Lang, key: usize) -> &'static str {
     let (fr, en) = TEXTS[key];
@@ -320,4 +325,14 @@ pub const TEXTS: &[(&str, &str)] = &[
     ("Upscaling", "Upscaling"),
     // 88
     ("Reconstruction temporelle avec vecteurs de mouvement (port FSR 3)", "Temporal reconstruction with motion vectors (FSR 3 port)"),
+    // 89
+    ("Créer une partie", "Create a game"),
+    // 90
+    ("Bots", "Bots"),
+    // 91
+    ("Serveur local intégré : démarrage automatique.", "Built-in local server: starts automatically."),
+    // 92
+    ("Serveur local impossible", "Local server failed"),
+    // 93
+    ("équipiers IA qui réparent les serveurs", "AI teammates repairing servers"),
 ];

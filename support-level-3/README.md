@@ -52,21 +52,28 @@ Binaires produites : `target/release/sl3-client` (le jeu) et `target/release/sl3
 **Lancement** : l'exécutable est **autoportant** — toutes les ressources (modèles, textures, sons, police) sont **embarquées dans le binaire**. Lancez-le depuis n'importe quel dossier, copiez-le seul, déplacez-le : aucune dépendance à `assets/` (la config `sl3_config.json` est créée à côté de l'exe).
 
 ```bash
-./target/release/sl3-server --port 27070     # terminal 1 : le serveur
-./target/release/sl3-client                  # terminal 2 : le jeu (fonctionne d'où vous voulez)
+./target/release/sl3-client                  # Héberger : le serveur local démarre TOUT SEUL
+./target/release/sl3-server --port 27070     # (optionnel) serveur dédié pour jouer en ligne
 ```
 
-## 🌐 Jouer en ligne (rooms)
+## 🌐 Jouer (rooms)
 
-Le client se connecte toujours à une **adresse de serveur** (par défaut `127.0.0.1:27070`). Le serveur gère plusieurs **rooms** simultanées, avec ou sans mot de passe.
+### Héberger — ça marche direct, sans serveur à lancer
 
-1. Une personne lance `sl3-server` sur une machine joignable :
+Cliquez **« Héberger une partie »** : le client **démarre un serveur local intégré** dans son propre processus (port éphémère), crée la room et vous y voilà. Plus d'erreur « connexion refusée (os error 10061) » — c'était l'ancien comportement, il fallait lancer `sl3-server` à la main, c'est fini.
+
+Sur l'écran **Créer une partie** :
+- **Mot de passe** (vide = aucun) — il se tape au clavier maintenant (avant, la saisie de texte n'existait carrément pas).
+- **Bots (équipiers IA)** : 0 à 3 bots rejoignent votre room et réparent des serveurs pendant que vous jouez. Parfait en solo.
+- `[Entrée]` ou clic : la room est créée, un **code à 4 caractères** est généré à donner à vos amis.
+
+### Rejoindre / jouer en ligne
+
+1. Une personne héberge comme ci-dessus, **ou** lance `sl3-server` sur une machine joignable :
    - **LAN** : rien à faire, l'IP locale suffit.
    - **Internet** : serveur dédié/VPS, ou redirection de port du routeur vers le port 27070 (TCP).
-2. Les joueurs lancent `sl3-client` :
-   - `[1] Héberger` → adresse du serveur → mot de passe (vide = aucun) → un **code de room à 4 caractères** est généré.
-   - `[2] Rejoindre` → adresse → **code** → mot de passe.
-3. L'hôte presse `[Espace]` pour démarrer la partie.
+2. Les autres joueurs : **« Rejoindre une partie »** → adresse → **code de la room** (il se tape au clavier) → mot de passe.
+3. L'hôte presse `[Espace]` ou clique « Démarrer la partie ».
 
 Test rapide sans GUI : `./target/release/sl3-server --bots 2` démarre une room avec 2 bots qui errent et réparent.
 
@@ -74,14 +81,14 @@ Test rapide sans GUI : `./target/release/sl3-server --bots 2` démarre une room 
 
 **Régénération des assets** : après modification de `assets/`, relancez `python3 tools/gen_bundle.py` pour rembarquer les fichiers dans le binaire (le test `bundle_covers_disk_exactly` vérifie la cohérence).
 
-**Mode autopilot (dev/QA)** : `SL3_AUTOPILOT="key Digit1@1; click 640 420@2; shot /tmp/x.png@3; mouse 640 300@3.5; yaw 90@4; exit@5" ./sl3-client` pilote le jeu (touches, **clics souris sur les boutons**, déplacement du curseur, yaw caméra) et capture des écrans automatiquement — c'est ce qui a permis de valider visuellement le rendu (menu cliquable, options FSR 3/DLSS, lobby, HUD, RT) sur pilote logiciel. `SL3_WINDOW_SIZE=640x360` réduit la fenêtre (tests sur pilote logiciel), `SL3_DEBUG=1` trace les frames et les clics.
+**Mode autopilot (dev/QA)** : `SL3_AUTOPILOT="click 640 310@1; key Enter@2; shot /tmp/x.png@3; look 200 0@4; down W@5; up W@7; type mdp@7.5; tp 11 15@8; exit@9" ./sl3-client` pilote le jeu : `click/mouse x y` (boutons cliquables), `key K` (Enter, F5, F6, E, F…), `down/up K` (maintien de touche — marche), `look dx dy` (mêmes maths que le raw input), `type TEXTE` (saisie dans les champs), `tp x z` (téléport QA), `yaw deg`, `shot chemin`, `exit`. Capture des écrans automatiquement — c'est ce qui a permis de valider visuellement le rendu (hébergement local, lobby avec bots, options FSR 3/DLSS, HUD, RT) sur pilote logiciel. `SL3_WINDOW_SIZE=LxH` réduit la fenêtre (tests sur pilote logiciel), `SL3_BLACKOUT_MIN/MAX` (serveur) décalent les coupures pour les captures, `SL3_DEBUG=1` trace les frames, les clics et la position.
 
 ## 🎮 Commandes
 
 | Touche | Action |
 |---|---|
 | `Z Q S D` / `W A S D` | Se déplacer |
-| Souris | Regarder |
+| Souris | Regarder (**raw input** : deltas bruts de la souris via `DeviceEvent::MouseMotion` / WM_INPUT — insensible à la sensibilité Windows, à la DPI/échelle et au pointer lock ; la vitesse se règle dans Options) |
 | `Maj` | Courir (endurance limitée — et ça attire l'Auditeur) |
 | `E` | Interagir (maintenir : reboot, terminal, disjoncteur, relever) |
 | `F` | Lampe torche (batterie !) |
@@ -140,20 +147,31 @@ l'auto à 60-75 %.
 ## ✨ Ray tracing (optionnel, RTX 2060+)
 
 Le client propose un **vrai ray tracing par rayons** (ombres, occlusion ambiante,
-rebond de lumière), calculé en shader contre une scène simplifiée en boîtes
-(AABB) — ~80 boîtes statiques fusionnées + les objets dynamiques (portes,
-baies serveurs, joueurs, l'Auditeur). wgpu 22 n'expose pas les RT cores (DXR),
-les rayons tournent donc sur les unités de calcul : très rapide sur une RTX 2060
-(~10 % du GPU en 1080p), et **strictement hors du chemin de rendu quand c'est
-désactivé**.
+rebond de lumière, **réflexions**), calculé en shader contre une scène simplifiée
+en boîtes (AABB) — ~80 boîtes statiques fusionnées + les objets dynamiques
+(portes, baies serveurs, joueurs, l'Auditeur). wgpu 22 n'expose pas les RT cores
+matériels (DXR / VK_KHR_ray_tracing_pipeline) : les rayons tournent sur les
+unités de calcul — très rapide sur une RTX 2060 (~10 % du GPU en 1080p), et
+**strictement hors du chemin de rendu quand c'est désactivé**. Vrai « RT
+matériel » = réécrire le moteur en Vulkan brut (ash) pour les acceleration
+structures : autre projet. En pratique, sur une scène intérieure simple comme
+ici, le rendu est le même — c'est le même algorithme d'intersection,
+accéléré par des GPU units différentes.
 
 Trois modes (mémorisés dans `sl3_config.json`) :
 
 | Mode | Effets | Coût |
 |---|---|---|
 | **Off** (défaut) | rendu classique identique à la v2 | zéro |
-| **Qualité** | ombres douces des néons (pénombres stables) + ombre de la torche + occlusion ambiante | tampon RT à 40 % de la résolution |
-| **Ultra** | + un rebond de lumière (GI approximatif) teinté par les néons | tampon RT à 50 % |
+| **Qualité** | ombres douces des néons (pénombres stables) + ombre de la torche + occlusion ambiante lissée + **réflexions des néons sur le sol** | tampon RT à 40 % de la résolution |
+| **Ultra** | + un rebond de lumière (GI approximatif) + AO à 3 rayons | tampon RT à 50 % |
+
+Lisibilité garantie : l'AO ne descend jamais sous 0,45 et l'ambiance n'est pas
+écrasée — une scène sans lumière reste sombre mais lisible en RT (avant, tout
+partait au noir). Aucun filtre « artificiel » plaqué : le RT n'ajoute que de la
+lumière physiquement plausible (ombres douces, rebonds, reflets spéculaires —
+fini les taches d'AO boueuses à un seul rayon : Qualité multiplie les
+échantillons et compresse la plage).
 
 - **En jeu** : `F5` cycle les modes (message dans le journal) — la ligne perf
   affiche `· RT` quand c'est actif.
@@ -178,6 +196,7 @@ cargo test
 - Tests unitaires **shared** : carte ASCII (connectivité BFS de tous les objectifs, longueur des lignes), roundtrip du protocole.
 - Tests unitaires **server** : reboot complet d'un serveur, validation de la note de frais → ouverture de la sortie → évasion → fin de partie, audition de l'entité.
 - Test d'intégration **lobby** : lance le vrai binaire serveur et joue toute la séquence en TCP (Hello → CreateRoom → mauvais mot de passe → JoinRoom → StartGame → GameStarted → snapshots → LeaveRoom).
+- Test **serveur local intégré** : `spawn_local` (le chemin du bouton Héberger) — connexion TCP, création de room avec bots, démarrage.
 - Test **assets** (client) : chaque GLTF charge via le même parseur que le jeu, matériaux connus du moteur, indices dans les bornes, budget de triangles respecté.
 - Tests **shaders** (client) : les 5 shaders WGSL (world, post, ui, rt, upscale) sont parsés et validés par **naga** — erreurs de GPU détectées sans GPU.
 - Tests **rtscene** (client) : fusion des murs (couverture de chaque cellule `#`), budget de boîtes, AABB tournées, cohérence de la scène statique.

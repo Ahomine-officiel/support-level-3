@@ -215,7 +215,7 @@ impl Game {
             terminal_done: false,
             fee_approved: false,
             blackout: None,
-            next_blackout: BLACKOUT_INTERVAL_MIN,
+            next_blackout: crate::blackout_bounds().0,
             exit_open: false,
             time: 0.0,
             over: false,
@@ -548,9 +548,8 @@ fn tick(g: &mut Game) {
     } else {
         g.next_blackout -= TICK_DT;
         if g.next_blackout <= 0.0 {
-            g.next_blackout = g
-                .rng
-                .gen_range(BLACKOUT_INTERVAL_MIN..BLACKOUT_INTERVAL_MAX);
+            let (bmin, bmax) = crate::blackout_bounds();
+            g.next_blackout = g.rng.gen_range(bmin..bmax);
             g.blackout = Some(BLACKOUT_DURATION);
             let (fr, en) = texts::announce("blackout", &[], &[]);
             announce(g, fr, en);

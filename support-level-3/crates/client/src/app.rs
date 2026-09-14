@@ -15,8 +15,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
 use winit::application::ApplicationHandler;
-use winit::dpi::PhysicalPosition;
-use winit::event::{ElementState, WindowEvent};
+use winit::event::{DeviceEvent, ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::Window;
@@ -24,8 +23,9 @@ use winit::window::Window;
 #[derive(Clone)]
 enum MenuScreen {
     Main,
-    AskHostAddr { buf: String },
-    HostPassword { buf: String },
+    /// Création de partie : mot de passe + nombre de bots (compagnons IA).
+    /// L'adresse n'est plus demandée : un serveur local intégré démarre tout seul.
+    HostSetup { buf: String, bots: u8 },
     AskJoinAddr { buf: String },
     AskCode { buf: String },
     AskPassword { code: String, buf: String },
@@ -60,6 +60,15 @@ enum AutoAct {
     Mouse(f64, f64),
     /// Clic gauche à (x, y) — menus à boutons.
     Click(f64, f64),
+    /// Regard caméra : mêmes maths que le raw input (DeviceEvent::MouseMotion).
+    Look(f64, f64),
+    /// Tape du texte dans le champ actif (comme event.text de winit).
+    Type(String),
+    /// Maintient une touche enfoncée (marche : down W … up W).
+    Down(KeyCode),
+    Up(KeyCode),
+    /// Téléport QA : tp x z yaw (place le joueur exactement).
+    Tp(f32, f32, f32),
     Exit,
 }
 
@@ -71,6 +80,11 @@ impl Clone for AutoAct {
             AutoAct::Yaw(a) => AutoAct::Yaw(*a),
             AutoAct::Mouse(x, y) => AutoAct::Mouse(*x, *y),
             AutoAct::Click(x, y) => AutoAct::Click(*x, *y),
+            AutoAct::Look(x, y) => AutoAct::Look(*x, *y),
+            AutoAct::Type(s) => AutoAct::Type(s.clone()),
+            AutoAct::Down(k) => AutoAct::Down(*k),
+            AutoAct::Up(k) => AutoAct::Up(*k),
+            AutoAct::Tp(x, z, y) => AutoAct::Tp(*x, *z, *y),
             AutoAct::Exit => AutoAct::Exit,
         }
     }
@@ -95,6 +109,10 @@ fn parse_key(name: &str) -> Option<KeyCode> {
         "F6" => KeyCode::F6,
         "KeyF" | "F" => KeyCode::KeyF,
         "KeyE" | "E" => KeyCode::KeyE,
+        "KeyW" | "W" | "KeyZ" | "Z" => KeyCode::KeyW,
+        "KeyA" | "A" | "KeyQ" | "Q" => KeyCode::KeyA,
+        "KeyS" | "S" => KeyCode::KeyS,
+        "KeyD" | "D" => KeyCode::KeyD,
         _ => return None,
     })
 }
@@ -116,6 +134,9 @@ fn parse_autopilot(s: &str) -> Option<Auto> {
             "key" => AutoAct::Key(parse_key(arg)?),
             "shot" => AutoAct::Shot(arg.to_string()),
             "yaw" => AutoAct::Yaw(arg.parse::<f32>().ok()?.to_radians()),
+            "type" => AutoAct::Type(arg.to_string()),
+            "down" => AutoAct::Down(parse_key(arg)?),
+            "up" => AutoAct::Up(parse_key(arg)?),
             "exit" => AutoAct::Exit,
             _ => {
                 // « mouse x y » et « click x y » : pilotage des boutons cliquables.
@@ -126,6 +147,8 @@ fn parse_autopilot(s: &str) -> Option<Auto> {
                 match verb2 {
                     "mouse" => AutoAct::Mouse(x, y),
                     "click" => AutoAct::Click(x, y),
+                    "look" => AutoAct::Look(x, y),
+                    "tp" => AutoAct::Tp(x as f32, y as f32, 0.0),
                     _ => return None,
                 }
             }
@@ -166,6 +189,9 @@ enum BtnAction {
     UpsQ(u8),
     /// 0 off, 1 qualité, 2 ultra.
     Rt(u8),
+    /// Bots (compagnons IA) à l'hébergement.
+    BotsUp,
+    BotsDown,
     Back,
     StartGame,
     LeaveLobby,
@@ -333,9 +359,9 @@ impl App {
     fn dispatch(&mut self, action: BtnAction) {
         match action {
             BtnAction::Host => {
-                self.mode = Mode::MainMenu(MenuScreen::AskHostAddr {
-                    buf: self.config.host_default.clone(),
-                });
+                // Hébergement : plus d'adresse à saisir — un serveur local intégré
+                // démarre automatiquement (l'erreur « connexion refusée » est morte).
+                self.mode = Mode::MainMenu(MenuScreen::HostSetup { buf: String::new(), bots: 1 });
             }
             BtnAction::Join => {
                 self.mode = Mode::MainMenu(MenuScreen::AskJoinAddr {
@@ -397,6 +423,18 @@ impl App {
                     r.set_rt_mode(v);
                 }
             }
+            BtnAction::BotsUp => {
+                if let Mode::MainMenu(MenuScreen::HostSetup { buf, bots }) = &self.mode {
+                    let (buf, bots) = (buf.clone(), (*bots).min(2) + 1);
+                    self.mode = Mode::MainMenu(MenuScreen::HostSetup { buf, bots });
+                }
+            }
+            BtnAction::BotsDown => {
+                if let Mode::MainMenu(MenuScreen::HostSetup { buf, bots }) = &self.mode {
+                    let (buf, bots) = (buf.clone(), (*bots).max(1) - 1);
+                    self.mode = Mode::MainMenu(MenuScreen::HostSetup { buf, bots });
+                }
+            }
             BtnAction::Back => {
                 self.mode = Mode::MainMenu(MenuScreen::Main);
             }
@@ -427,6 +465,94 @@ impl App {
                 self.pending = Some(pending);
             }
             Err(e) => self.show_err(format!("{} : {e}", t(self.lang, CONNECTING))),
+        }
+    }
+
+    /// Hébergement : démarre un serveur local intégré dans ce processus puis s'y
+    /// connecte. Plus besoin de lancer sl3-server à la main : cliquer « Héberger »
+    /// suffit (fini l'erreur « connexion refusée (os error 10061) »).
+    fn start_hosting(&mut self, password: String, bots: usize) {
+        match sl3_server::spawn_local(bots) {
+            Ok(port) => {
+                let addr = format!("127.0.0.1:{port}");
+                self.connect(addr, Pending::Create { password });
+            }
+            Err(e) => self.show_err(format!("{} : {e}", t(self.lang, E_LOCAL_SERVER))),
+        }
+    }
+
+    /// Saisie clavier caractère par caractère (winit : `event.text`) pour les
+    /// champs texte (mot de passe, code de room, adresse, nom). Avant cette
+    /// fonction, il était IMPOSSIBLE de taper du texte dans ces champs.
+    fn handle_text_char(&mut self, ch: char) {
+        if !matches!(self.mode, Mode::MainMenu(_)) {
+            return;
+        }
+        if let Mode::MainMenu(screen) = &self.mode {
+            let next = match screen {
+                MenuScreen::AskJoinAddr { buf } => {
+                    if buf.chars().count() < 32 {
+                        let mut b = buf.clone();
+                        b.push(ch);
+                        Some(MenuScreen::AskJoinAddr { buf: b })
+                    } else {
+                        None
+                    }
+                }
+                MenuScreen::AskCode { buf } => {
+                    if buf.chars().count() < CODE_LEN {
+                        let mut b = buf.clone();
+                        b.push(ch);
+                        Some(MenuScreen::AskCode { buf: b })
+                    } else {
+                        None
+                    }
+                }
+                MenuScreen::AskPassword { code, buf } => {
+                    if buf.chars().count() < 24 {
+                        let mut b = buf.clone();
+                        b.push(ch);
+                        Some(MenuScreen::AskPassword { code: code.clone(), buf: b })
+                    } else {
+                        None
+                    }
+                }
+                MenuScreen::AskName { buf } => {
+                    if buf.chars().count() < MAX_NAME_LEN {
+                        let mut b = buf.clone();
+                        b.push(ch);
+                        Some(MenuScreen::AskName { buf: b })
+                    } else {
+                        None
+                    }
+                }
+                MenuScreen::HostSetup { buf, bots } => {
+                    if buf.chars().count() < 24 {
+                        let mut b = buf.clone();
+                        b.push(ch);
+                        Some(MenuScreen::HostSetup { buf: b, bots: *bots })
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            if let Some(s) = next {
+                self.mode = Mode::MainMenu(s);
+            }
+        }
+    }
+
+    /// Regard caméra par deltas SOURIS BRUTS (raw input).
+    /// Appelé depuis `DeviceEvent::MouseMotion` (WM_INPUT sous Windows : deltas
+    /// indépendants de la position du curseur, de l'accélération système et du
+    /// pointer lock) et depuis l'autopilot (« look dx dy »).
+    fn apply_look(&mut self, dx: f64, dy: f64) {
+        if let Some(g) = self.game.as_mut() {
+            let sens = self.config.sensitivity;
+            g.yaw += (dx as f32) * 0.0022 * sens;
+            g.pitch -= (dy as f32) * 0.0022 * sens;
+            g.pitch = g.pitch.clamp(-1.45, 1.45);
         }
     }
 
@@ -708,9 +834,7 @@ impl App {
         match screen {
             MenuScreen::Main => match code {
                 KeyCode::Digit1 => {
-                    self.mode = Mode::MainMenu(MenuScreen::AskHostAddr {
-                        buf: self.config.host_default.clone(),
-                    });
+                    self.mode = Mode::MainMenu(MenuScreen::HostSetup { buf: String::new(), bots: 1 });
                 }
                 KeyCode::Digit2 => {
                     self.mode = Mode::MainMenu(MenuScreen::AskJoinAddr {
@@ -723,30 +847,19 @@ impl App {
                 KeyCode::Escape => std::process::exit(0),
                 _ => {}
             },
-            MenuScreen::AskHostAddr { buf } => {
+            MenuScreen::HostSetup { buf, bots } => {
                 if back {
                     self.back_to_menu();
                 } else if code == KeyCode::Backspace {
                     let mut b = buf.clone();
                     b.pop();
-                    self.mode = Mode::MainMenu(MenuScreen::AskHostAddr { buf: b });
-                } else if enter {
-                    self.config.host_default = buf.clone();
-                    self.config.save();
-                    self.mode = Mode::MainMenu(MenuScreen::HostPassword { buf: String::new() });
-                }
-            }
-            MenuScreen::HostPassword { buf } => {
-                if back {
-                    self.back_to_menu();
-                } else if code == KeyCode::Backspace {
-                    let mut b = buf.clone();
-                    b.pop();
-                    self.mode = Mode::MainMenu(MenuScreen::HostPassword { buf: b });
+                    let bots = *bots;
+                    self.mode = Mode::MainMenu(MenuScreen::HostSetup { buf: b, bots });
                 } else if enter {
                     let password = buf.clone();
-                    let addr = self.config.host_default.clone();
-                    self.connect(addr, Pending::Create { password });
+                    let bots = *bots as usize;
+                    // Démarre un serveur local intégré puis s'y connecte (création de room).
+                    self.start_hosting(password, bots);
                 }
             }
             MenuScreen::AskJoinAddr { buf } => {
@@ -1080,16 +1193,24 @@ impl App {
                 self.button(ui, &font, BtnAction::OptionsMenu, w / 2.0 - 190.0, h * 0.40 + 112.0, 380.0, 44.0, t(self.lang, BTN_OPTIONS), BtnState::Normal);
                 self.button(ui, &font, BtnAction::Quit, w / 2.0 - 130.0, h * 0.40 + 180.0, 260.0, 36.0, t(self.lang, BTN_QUIT), BtnState::Normal);
             }
-            MenuScreen::AskHostAddr { buf } => {
-                draw_center(ui, &font, t(self.lang, ADDR_PROMPT), 20.0, WHITE_C, (w, h * 0.45));
-                draw_center(ui, &font, &format!("{buf}_"), 22.0, AMBER_C, (w, h * 0.45 + 40.0));
-                draw_center(ui, &font, &format!("{} – [Entrée] valider", t(self.lang, BACK_HINT)), 14.0, DIM_C, (w, h * 0.8));
-            }
-            MenuScreen::HostPassword { buf } => {
+            MenuScreen::HostSetup { buf, bots } => {
+                // Création de partie : serveur local intégré (auto), mot de passe, bots.
+                draw_center(ui, &font, t(self.lang, HOST_SETUP), 26.0, WHITE_C, (w, h * 0.28));
+                draw_center(ui, &font, t(self.lang, PASSWORD_PROMPT), 17.0, DIM_C, (w, h * 0.38));
                 let shown: String = buf.chars().map(|_| '*').collect();
-                draw_center(ui, &font, t(self.lang, PASSWORD_PROMPT), 20.0, WHITE_C, (w, h * 0.45));
-                draw_center(ui, &font, &format!("{shown}_"), 22.0, AMBER_C, (w, h * 0.45 + 40.0));
-                draw_center(ui, &font, t(self.lang, BACK_HINT), 14.0, DIM_C, (w, h * 0.8));
+                draw_center(ui, &font, &format!("{shown}_"), 22.0, AMBER_C, (w, h * 0.38 + 38.0));
+                // Rangée bots : - Bots : N + (même géométrie que la rangée sensibilité)
+                let by = h * 0.52;
+                self.button(ui, &font, BtnAction::BotsDown, w / 2.0 - 180.0, by, 44.0, 36.0, "-", BtnState::Normal);
+                self.button(ui, &font, BtnAction::BotsUp, w / 2.0 + 136.0, by, 44.0, 36.0, "+", BtnState::Normal);
+                let lbl = format!("{} : {}", t(self.lang, BOTS_LABEL), bots);
+                let tw = crate::gpu::ui::text_width(&font, &lbl, 18.0);
+                ui.push(UiOp::text(w / 2.0 - tw / 2.0, by + 9.0, 18.0, WHITE_C, &lbl));
+                let sub = t(self.lang, BOTS_SUB);
+                let sw = crate::gpu::ui::text_width(&font, sub, 12.0);
+                ui.push(UiOp::text(w / 2.0 - sw / 2.0, by + 44.0, 12.0, DIM_C, sub));
+                draw_center(ui, &font, t(self.lang, LOCAL_NOTE), 14.0, GREEN_C, (w, h * 0.64));
+                draw_center(ui, &font, &format!("{} – [Entrée] créer", t(self.lang, BACK_HINT)), 14.0, DIM_C, (w, h * 0.8));
             }
             MenuScreen::AskJoinAddr { buf } => {
                 draw_center(ui, &font, t(self.lang, ADDR_PROMPT), 20.0, WHITE_C, (w, h * 0.45));
@@ -1384,6 +1505,11 @@ impl App {
                         r.capture_path = Some(std::path::PathBuf::from(&p));
                         println!("[autopilot] capture -> {p}");
                     }
+                    if std::env::var("SL3_DEBUG").is_ok() {
+                        if let Some(g) = &self.game {
+                            eprintln!("[sl3-debug] pos=({:.1},{:.1}) yaw={:.2}", g.pos.x, g.pos.z, g.yaw);
+                        }
+                    }
                 }
                 AutoAct::Yaw(a) => {
                     if let Some(g) = self.game.as_mut() {
@@ -1396,6 +1522,37 @@ impl App {
                 AutoAct::Click(x, y) => {
                     self.cursor_pos = (x as f32, y as f32);
                     self.on_click();
+                }
+                AutoAct::Look(dx, dy) => {
+                    // Même chemin que DeviceEvent::MouseMotion (raw input).
+                    if self.cursor_locked {
+                        self.apply_look(dx, dy);
+                    }
+                }
+                AutoAct::Type(s) => {
+                    for ch in s.chars() {
+                        self.handle_text_char(ch);
+                    }
+                }
+                AutoAct::Down(k) => {
+                    self.keys.insert(k);
+                    if std::env::var("SL3_DEBUG").is_ok() {
+                        eprintln!("[sl3-debug] down {k:?} ({} touches)", self.keys.len());
+                    }
+                }
+                AutoAct::Up(k) => {
+                    self.keys.remove(&k);
+                    if std::env::var("SL3_DEBUG").is_ok() {
+                        eprintln!("[sl3-debug] up {k:?}");
+                    }
+                }
+                AutoAct::Tp(x, z, _yaw) => {
+                    if let Some(g) = self.game.as_mut() {
+                        g.pos = Vec3::new(x, 0.0, z);
+                        if std::env::var("SL3_DEBUG").is_ok() {
+                            eprintln!("[sl3-debug] tp ({x},{z})");
+                        }
+                    }
                 }
                 AutoAct::Exit => {
                     self.config.save();
@@ -1439,6 +1596,18 @@ impl ApplicationHandler for App {
         self.renderer = Some(renderer);
     }
 
+    fn device_event(&mut self, _el: &ActiveEventLoop, _id: winit::event::DeviceId, event: DeviceEvent) {
+        // RAW INPUT (demande explicite du joueur) : les deltas souris viennent de
+        // la souris elle-même (WM_INPUT sous Windows), pas de la position du
+        // curseur : ça marche quel que soit le pointer lock, la DPI/échelle ou
+        // l'accélération du pointeur. Uniquement en partie (menus = curseur libre).
+        if let DeviceEvent::MouseMotion { delta } = event {
+            if self.cursor_locked {
+                self.apply_look(delta.0, delta.1);
+            }
+        }
+    }
+
     fn window_event(&mut self, el: &ActiveEventLoop, _id: winit::window::WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => {
@@ -1451,30 +1620,11 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
-                if self.cursor_locked {
-                    if let (Some(win), Some(r)) = (&self.window, &self.renderer) {
-                        let (w, h) = r.size();
-                        let cx = w as f64 / 2.0;
-                        let cy = h as f64 / 2.0;
-                        let dx = position.x - cx;
-                        let dy = position.y - cy;
-                        if dx.abs() < 600.0 && dy.abs() < 600.0 {
-                            if let Some(g) = self.game.as_mut() {
-                                let sens = self.config.sensitivity;
-                                g.yaw += (dx as f32) * 0.0022 * sens;
-                                g.pitch -= (dy as f32) * 0.0022 * sens;
-                                g.pitch = g.pitch.clamp(-1.45, 1.45);
-                            }
-                        }
-                        if let Ok(op) = win.outer_position() {
-                            let _ = win.set_cursor_position(PhysicalPosition::new(
-                                op.x + cx as i32,
-                                op.y + cy as i32,
-                            ));
-                        }
-                    }
-                } else {
-                    // Menus : suivi du curseur pour survol + clic des boutons.
+                // Menus uniquement : suivi du curseur (survol + clic des boutons).
+                // En jeu, le regard vient du RAW INPUT (device_event) : la position
+                // du curseur est ignorée et on ne la recentre plus de force (ça
+                // luttait avec le grab et tuait la souris sous Windows).
+                if !self.cursor_locked {
                     self.cursor_pos = (position.x as f32, position.y as f32);
                 }
             }
@@ -1493,6 +1643,15 @@ impl ApplicationHandler for App {
                 };
                 match event.state {
                     ElementState::Pressed => {
+                        // Saisie de texte réelle (champs mot de passe / code / nom) :
+                        // event.text respecte la disposition clavier (AZERTY inclus).
+                        if let Some(txt) = &event.text {
+                            for ch in txt.chars() {
+                                if !ch.is_control() {
+                                    self.handle_text_char(ch);
+                                }
+                            }
+                        }
                         if self.keys.insert(code) {
                             self.on_key_pressed(code, el);
                         }

@@ -4,10 +4,13 @@
 // de la scène :
 //   - ombre douces des néons (rayon d'ombre par lumière proche, jitter stable)
 //   - ombre de la lampe torche (rayon déterministe)
-//   - occlusion ambiante (1 rayon cosinus hémisphère)
+//   - occlusion ambiante (1 rayon en Qualité, 3 en Ultra) avec plancher de
+//     lisibilité : plus de scènes écrasées au noir quand il n'y a pas de lumière
 //   - un rebond de lumière approximatif depuis le point touché (mode Ultra)
+//   - RÉFLEXIONS : les néons se reflètent sur les sols polis (lino) et aux
+//     angles rasants (Fresnel) — c'est le « wow » du ray tracing
 // Sortie MRT : out0 = (ao, ombre_statique, ombre_torche, 1)
-//              out1 = (gi.rgb, 1)
+//              out1 = (gi.rgb + réflexions néon, 1)
 // Résolution indépendante (0.4x / 0.5x du tampon monde) — pensé RTX 2060.
 
 struct WorldU {
@@ -26,7 +29,7 @@ struct RtParams {
     cam_pos: vec4<f32>,
     dims: vec4<f32>,   // x,y : taille tampon RT · z,w : taille texture profondeur
     counts: vec4<f32>, // x : boîtes statiques · y : dynamiques · z : lumières · w : rayon AO
-    misc: vec4<f32>,   // x : force GI · y : AO appliquée à la lumière directe · z,w : réserve
+    misc: vec4<f32>,   // x : force GI · y : réserve · z : échantillons AO (1 ou 3) · w : réserve
 };
 
 struct GpuAabb {
@@ -248,43 +251,85 @@ fn fs(in: VSOut) -> FSOut {
         }
     }
 
-    // ---- AO + rebond (1 rayon cosinus hémisphère, hash stable) ----
+    // ---- AO + rebond (1 rayon en Qualité, 3 en Ultra) ----
+    // Plancher de lisibilité : l'AO ne descend jamais sous 0.45 — avant, une
+    // scène sans lumière partait au noir absolu (« on voit rien »).
     let ao_radius = rp.counts.w;
-    var ao = 1.0;
+    let ao_samples = u32(max(rp.misc.z, 1.0));
+    var ao_acc = 0.0;
     var gi = vec3<f32>(0.0, 0.0, 0.0);
     let up = select(vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(1.0, 0.0, 0.0), abs(n.y) > 0.9);
     let t_dir = normalize(cross(n, up));
     let b_dir = cross(n, t_dir);
-    let u1 = hash1(vec3<f32>(f32(px.x) * 1.13, f32(px.y) * 1.27, 3.1));
-    let u2 = hash1(vec3<f32>(f32(px.x) * 1.71, f32(px.y) * 1.93, 9.4));
-    let ang = u1 * 6.2831853;
-    let rr = sqrt(u2);
-    let local = vec3<f32>(cos(ang) * rr, sin(ang) * rr, sqrt(max(1.0 - u2, 0.0)));
-    let dir_w = normalize(t_dir * local.x + b_dir * local.y + n * local.z);
-    var hn = vec3<f32>(0.0, 1.0, 0.0);
-    let t = trace(p + n * 0.012, dir_w, ao_radius, &hn);
-    if (t >= 0.0) {
-        ao = clamp(t / ao_radius, 0.0, 1.0);
-        ao = ao * ao; // rapproche le profil d'un AO multi-échantillons
-        // Rebond approximatif : depuis le point touché, contribution des néons.
-        if (rp.misc.x > 0.001) {
-            let hp2 = p + dir_w * t + hn * 0.01;
-            for (var i = 0u; i < 24u; i = i + 1u) {
-                if (i >= nl_count) { break; }
-                let lp = u.light_pos[i];
-                let lc = u.light_col[i];
-                if (lc.w <= 0.01) { continue; }
-                let tol = lp.xyz - hp2;
-                let dl = length(tol);
-                if (dl > lp.w) { continue; }
-                let attl = smoothstep(lp.w, lp.w * 0.2, dl);
-                gi = gi + lc.rgb * lc.w * attl * attl * max(dot(hn, tol / max(dl, 0.001)), 0.0);
+    for (var s = 0u; s < ao_samples; s = s + 1u) {
+        let u1 = hash1(vec3<f32>(f32(px.x) * 1.13, f32(px.y) * 1.27, 3.1 + f32(s) * 17.73));
+        let u2 = hash1(vec3<f32>(f32(px.x) * 1.71, f32(px.y) * 1.93, 9.4 + f32(s) * 23.31));
+        let ang = u1 * 6.2831853;
+        let rr = sqrt(u2);
+        let local = vec3<f32>(cos(ang) * rr, sin(ang) * rr, sqrt(max(1.0 - u2, 0.0)));
+        let dir_w = normalize(t_dir * local.x + b_dir * local.y + n * local.z);
+        var hn = vec3<f32>(0.0, 1.0, 0.0);
+        let t = trace(p + n * 0.012, dir_w, ao_radius, &hn);
+        if (t >= 0.0) {
+            let occ = clamp(t / ao_radius, 0.0, 1.0);
+            ao_acc = ao_acc + occ * occ; // rapproche le profil d'un AO multi-échantillons
+            // Rebond approximatif : depuis le point touché, contribution des néons.
+            if (rp.misc.x > 0.001) {
+                let hp2 = p + dir_w * t + hn * 0.01;
+                for (var i = 0u; i < 24u; i = i + 1u) {
+                    if (i >= nl_count) { break; }
+                    let lp = u.light_pos[i];
+                    let lc = u.light_col[i];
+                    if (lc.w <= 0.01) { continue; }
+                    let tol = lp.xyz - hp2;
+                    let dl = length(tol);
+                    if (dl > lp.w) { continue; }
+                    let attl = smoothstep(lp.w, lp.w * 0.2, dl);
+                    gi = gi + lc.rgb * lc.w * attl * attl * max(dot(hn, tol / max(dl, 0.001)), 0.0);
+                }
             }
-            gi = gi * rp.misc.x * 0.5;
+        } else {
+            ao_acc = ao_acc + 1.0; // rayon perdu : pas d'occlusion
         }
+    }
+    var ao = ao_acc / f32(ao_samples);
+    ao = 0.45 + 0.55 * ao;
+    gi = gi * rp.misc.x * 0.5 / f32(ao_samples);
+
+    // ---- Réflexions : néons sur sols polis + Fresnel aux angles rasants ----
+    // Le rayon réfléchi part du sol : s'il « voit » une sphère de néon (et que
+    // rien ne bloque la vue), le néon brille dans le sol — reflets mouillés.
+    var refl = vec3<f32>(0.0, 0.0, 0.0);
+    let vdir = normalize(p - rp.cam_pos.xyz);
+    let ndv = max(dot(n, -vdir), 0.0);
+    let fres = 0.04 + 0.96 * pow(1.0 - ndv, 5.0); // Schlick
+    let polished = select(0.0, 1.0, n.y > 0.5);   // sols (lino ciré) : reflets forts
+    let rk = clamp(polished * 0.85 + fres, 0.0, 1.0);
+    if (rk > 0.03) {
+        let rdir = reflect(vdir, n);
+        let ro2 = p + n * 0.012;
+        for (var i = 0u; i < 24u; i = i + 1u) {
+            if (i >= nl_count) { break; }
+            let lp = u.light_pos[i];
+            let lc = u.light_col[i];
+            if (lc.w <= 0.01) { continue; }
+            // Le néon pend juste sous le plafond : sphère émissive ~0.45 m.
+            let sc = lp.xyz - vec3<f32>(0.0, 0.18, 0.0);
+            let to = sc - ro2;
+            let ds = length(to);
+            if (ds > 26.0 || ds < 0.3) { continue; }
+            let ldir = to / ds;
+            let align = dot(ldir, rdir);
+            if (align < 0.86) { continue; } // cône gloss autour du rayon miroir
+            // Occlusion : un mur entre le sol et le néon casse le reflet.
+            if (shadow_ray(ro2, ldir, ds - 0.5) < 0.5) { continue; }
+            let glow = lc.rgb * lc.w * (1.0 - clamp(ds / 26.0, 0.0, 1.0) * 0.65);
+            refl = refl + glow * smoothstep(0.86, 1.0, align);
+        }
+        refl = refl * 1.8;
     }
 
     o.out0 = vec4<f32>(ao, sh_static, sh_flash, 1.0);
-    o.out1 = vec4<f32>(gi, 1.0);
+    o.out1 = vec4<f32>(gi + refl, 1.0);
     return o;
 }

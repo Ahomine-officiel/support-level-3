@@ -13,28 +13,30 @@ use std::sync::Arc;
 pub fn spawn_bots(room: &Arc<Room>, n: usize) {
     let map: &'static MapData = Box::leak(Box::new(MapData::parse()));
     for i in 0..n {
+        // Enregistrement SYNCHRONE : la liste du lobby est complète immédiatement
+        // (important pour l'hébergement local, où le client broadcast juste après).
+        let id;
+        {
+            let mut next = room.next_id.lock().unwrap();
+            id = *next;
+            *next = next.wrapping_add(1).max(1);
+        }
+        room.players.lock().unwrap().push(crate::PlayerSlot {
+            id,
+            name: format!("BOT-{i}"),
+            tx: std::sync::mpsc::channel().0,
+            alive_conn: false,
+        });
+
         let room2 = room.clone();
         let map = map;
         std::thread::spawn(move || {
-            let name = format!("BOT-{i}");
-            // Enregistrer le bot dans la room (canal jetable : alive_conn=false).
-            let id;
-            {
-                let mut next = room2.next_id.lock().unwrap();
-                id = *next;
-                *next = next.wrapping_add(1).max(1);
-            }
-            room2.players.lock().unwrap().push(crate::PlayerSlot {
-                id,
-                name: name.clone(),
-                tx: std::sync::mpsc::channel().0,
-                alive_conn: false,
-            });
-
+            let bot_id = id;
+            let bot_index = i;
             let mut rng = rand::thread_rng();
-            let mut pos = map.spawn + Vec3::new(i as f32 * 1.5, 0.0, 0.0);
+            let mut pos = map.spawn + Vec3::new(bot_index as f32 * 1.5, 0.0, 0.0);
             let mut path: VecDeque<(isize, isize)> = VecDeque::new();
-            let mut target_srv = i % SERVER_COUNT;
+            let mut target_srv = bot_index % SERVER_COUNT;
             let mut hold_ticks = 0u32;
             let mut holding = false;
 
@@ -59,14 +61,14 @@ pub fn spawn_bots(room: &Arc<Room>, n: usize) {
                     // Arrivé à côté du serveur : maintenir E.
                     if !holding {
                         let _ = room2.tx.send(RoomCmd::Player(
-                            id,
+                            bot_id,
                             ClientMsg::InteractStart { target: Interactable::Server(target_srv as u8) },
                         ));
                         holding = true;
                     }
                     hold_ticks += 1;
                     if hold_ticks > 80 {
-                        let _ = room2.tx.send(RoomCmd::Player(id, ClientMsg::InteractStop));
+                        let _ = room2.tx.send(RoomCmd::Player(bot_id, ClientMsg::InteractStop));
                         holding = false;
                         hold_ticks = 0;
                         target_srv = rng.gen_range(0..SERVER_COUNT);
@@ -90,14 +92,14 @@ pub fn spawn_bots(room: &Arc<Room>, n: usize) {
                     // Arrivé à côté du serveur : maintenir E.
                     if !holding {
                         let _ = room2.tx.send(RoomCmd::Player(
-                            id,
+                            bot_id,
                             ClientMsg::InteractStart { target: Interactable::Server(target_srv as u8) },
                         ));
                         holding = true;
                     }
                     hold_ticks += 1;
                     if hold_ticks > 70 {
-                        let _ = room2.tx.send(RoomCmd::Player(id, ClientMsg::InteractStop));
+                        let _ = room2.tx.send(RoomCmd::Player(bot_id, ClientMsg::InteractStop));
                         holding = false;
                         hold_ticks = 0;
                         target_srv = rng.gen_range(0..SERVER_COUNT);
@@ -105,7 +107,7 @@ pub fn spawn_bots(room: &Arc<Room>, n: usize) {
                 }
 
                 let _ = room2.tx.send(RoomCmd::Player(
-                    id,
+                    bot_id,
                     ClientMsg::Input { pos, yaw: 0.0, pitch: 0.0, sprint, light_on: true },
                 ));
             }

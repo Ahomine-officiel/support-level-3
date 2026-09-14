@@ -2147,6 +2147,7 @@ dependencies = [
  "rodio",
  "serde",
  "serde_json",
+ "sl3-server",
  "sl3-shared",
  "wgpu",
  "winit",
