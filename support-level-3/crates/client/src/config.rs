@@ -52,7 +52,7 @@ impl Config {
         match std::fs::read_to_string(Self::path()) {
             Ok(s) => {
                 let mut c: Config = serde_json::from_str(&s).unwrap_or_default();
-                c.rt_mode = c.rt_mode.min(2);
+                c.rt_mode = c.rt_mode.min(3);
                 c.upscaler = c.upscaler.min(2);
                 c.upscale_quality = c.upscale_quality.min(2);
                 c

@@ -4,9 +4,10 @@
 set -u
 export PATH="$HOME/.local-mesa/xauthdir/usr/bin:$PATH"
 export VK_ICD_FILENAMES="$HOME/.local-mesa/usr/share/vulkan/icd.d/lvp_icd.json"
-export LD_LIBRARY_PATH="$HOME/.local-mesa/usr/lib/x86_64-linux-gnu"
+export LD_LIBRARY_PATH="$HOME/.local-mesa/usr/lib/x86_64-linux-gnu:$HOME/.local-x11/usr/lib/x86_64-linux-gnu:$HOME/.local-alsa/usr/lib/x86_64-linux-gnu"
 export MESA_GL_VERSION_OVERRIDE=4.5
 SCRIPT="${1:?scenario autopilot manquant}"
+export SL3_AUTOPILOT="${SL3_AUTOPILOT:-$SCRIPT}"
 BIN="${2:-./target/release/sl3-client}"
 LOG="${3:-/tmp/sl3_headless.log}"
 # Serveur X dédié (numéro auto) + client dans le même processus de commande

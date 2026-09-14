@@ -164,3 +164,29 @@ Stage Summary:
 - Souris en jeu = RAW INPUT (DeviceEvent::MouseMotion/WM_INPUT) comme demandé : deltas bruts indépendants du pointer lock et de la sensibilité Windows ; saisie de texte réelle dans tous les champs (AZERTY ok).
 - RT : AO plancher + multi-échantillons + réflexions néon sur sols — plus de noir crushé ni de taches artificielles ; « RT matériel » impossible avec wgpu 22 (documenté) ; tout validé en partie réelle sous lavapipe, 13 suites de tests vertes, 0 warning.
 - Livrable : /home/z/my-project/download/support-level-3.zip (15,5 Mo).
+
+---
+Task ID: 6-e
+Agent: Super Z (agent principal)
+Task: « quand j'ai vu le rt pour la première fois c'était wow là c un peu décevant » — restaurer le facteur « wow » du RT sans réintroduire les artefacts (noir crushé, filtre artificiel).
+
+Work Log:
+- DIAGNOSTIC (le vrai problème était caché) : en re-capturant le chemin 6-d sous lavapipe, les captures « validées » étaient en réalité PRESQUE NOires en RT — le joueur avait raison. Deux causes racine trouvées dans rt.wgsl :
+  (1) AUTO-OMBRE DES NÉONS : les rayons d'ombre (sol → néon) rencontraient la boîte AABB du support de luminaire / piquaient dans la dalle du plafond (lumière à y=2,85, plafond à 3,0, jitter ±0,18 → cibles à 3,03) → sh_static ≈ 0 : TOUS les halos disparaissaient en RT alors qu'ils sont visibles hors RT (« c'était wow avant, c'est décevant » = le RT éteignait les néons).
+  (2) LA GI ÉTAIT COUPÉE en mode Qualité (misc.x = 0.0) et faible en Ultra (0.55) ; les réflexions ne montraient que des sphères de néon (pas la scène).
+- FIX SHADER (rt.wgsl) :
+  • shadow_ray_light() : variante de shadow_ray qui IGNORE les boîtes contenant le point lumière (marge 0,06) — le néon ne peut plus se bloquer lui-même ; appliqué aux 3 usages : ombres douces, occlusion des reflets spéculaires, ombre de la lumière dominante dans les reflets pleine scène.
+  • Jitter de pénombre 0,36 → 0,24 : sous un plafond à 3 m, les cibles restent ≤ 2,97 (plus de piqué dans la dalle) — pénombre un peu plus serrée, zéro scintillement.
+  • RÉFLEXION PLEINE SCÈNE : le rayon miroir trace maintenant TOUTE la scène (trace() 34 m) ; le point touché est ré-éclairé (ambiance + néons directs + ombre portée de la lumière dominante uniquement — 1 rayon de perf + la torche complète : spot×nl×att²×1,7×vis) puis pondéré rk (Fresnel Schlick + sols polis) × 0,38 × fondu exp(-0,045·t) — le lino renvoie le couloir, les portes, les montants et la traînée de sa propre lampe.
+  • Cône gloss élargi pour les sols (0,86 → 0,78) : traînées de néon plus larges.
+- FIX LUMIÈRES (game.rs) : néons 0,85 → 1,5 d'intensité, portée 7,5 → 9,0 m — les halos au sol sont enfin présents dans les DEUX modes (RT ou pas), l'ambiance horror reste portée par l'ambiance basse + brouillard.
+- FIX GI (gpu/mod.rs) : Qualité passe de GI 0,0 → 0,4 ; Ultra 0,55 → 0,75. Le mode Qualité vit enfin (rebonds colorés des néons).
+- OUTILS/INFRA : run_headless.sh corrigé (le scénario passé en $1 n'était JAMAIS exporté vers SL3_AUTOPILOT — les runs précédents utilisaient la variable d'env directement) + LD_LIBRARY_PATH complété (x11, alsa) ; nouveau scripts/build_sl3.sh (PKG_CONFIG_PATH alsa + RUSTFLAGS -L native alsa/x11 — le .pc du .deb pointe vers /usr/lib, inexistant dans le conteneur) ; scripts/montage_rt.py (comparatif 3 panneaux).
+- PIÈGE : sl3_config.json est SAUVEGARDÉ à la sortie du client — les F5 des runs précédents décalaient le mode de départ des runs suivants (les captures « qualite/ultra/off » étaient décalées d'un cran). Nouveau protocole : config fraîche écrite AVANT chaque run, tags HUD vérifiés par crop zoomé.
+- VALIDATION (lavapipe + Xvfb + autopilot, captures relues, tags vérifiés) : clic Héberger → salon → en jeu → tp (41,43) allée aux 5 néons (rangée 21) : OFF = couloir éteint presque noir ; QUALITÉ = halos néon, structures plafond reluites par GI, lueur rouge du fond, sol lisible ; ULTRA = + modelé des murs, AO de contact autour des débris, lignes de réflexion des montants dans le lino. 16/16 tests verts (dont shaders.rs qui re-valide le WGSL naga), build release 0 warning.
+- Captures : download/captures/{rt_wow_off,rt_wow_qualite,rt_wow_ultra,rt_neon_off,rt_neon_ultra}.png + download/comparaison_rt_off_qualite_ultra.png (montage 1920×394).
+
+Stage Summary:
+- Cause du « c'était wow avant » identifiée et corrigée : le RT auto-ombrait les néons (support luminaire + dalle) et la GI était coupée en Qualité — le RT ÉTEIGNAIT les lumières au lieu d'ajouter.
+- Le RT ajoute maintenant réellement : halos conservés + pénombres, GI dès Qualité, réflexions pleine scène (couloir/portes/torche) dans le lino ciré, néons plus présents (1,5 / 9 m) dans les deux modes.
+- 16/16 tests, 0 warning, livrable re-packagé : download/support-level-3.zip.

@@ -287,9 +287,9 @@ impl App {
         }
     }
 
-    /// Cycle le mode ray tracing (off -> qualité -> ultra), applique et persiste.
+    /// Cycle le mode ray tracing (off -> qualité -> ultra -> overdrive), applique et persiste.
     fn cycle_rt_mode(&mut self) -> &'static str {
-        self.config.rt_mode = (self.config.rt_mode + 1) % 3;
+        self.config.rt_mode = (self.config.rt_mode + 1) % 4;
         self.config.save();
         if let Some(r) = self.renderer.as_mut() {
             r.set_rt_mode(self.config.rt_mode);
@@ -297,6 +297,7 @@ impl App {
         match self.config.rt_mode {
             1 => t(self.lang, RT_QUAL),
             2 => t(self.lang, RT_ULTRA),
+            3 => t(self.lang, RT_OVERDRIVE),
             _ => t(self.lang, RT_OFF),
         }
     }
@@ -1095,7 +1096,12 @@ impl App {
                         1.0
                     })
                     * 100.0) as u32;
-                let rt_tag = if self.config.rt_mode > 0 { " – RT" } else { "" };
+                let rt_tag = match self.config.rt_mode {
+                    1 => format!(" – {} – {} r/px", t(self.lang, RT_TAG_Q), crate::gpu::Renderer::rt_ray_count(1)),
+                    2 => format!(" – {} – {} r/px", t(self.lang, RT_TAG_U), crate::gpu::Renderer::rt_ray_count(2)),
+                    3 => format!(" – {} – {} r/px", t(self.lang, RT_TAG_OD), crate::gpu::Renderer::rt_ray_count(3)),
+                    _ => String::new(),
+                };
                 let ups_tag = if renderer.ups_active() {
                     format!(
                         " – {} {}",
@@ -1321,14 +1327,15 @@ impl App {
                 let row_y = if self.config.upscaler > 0 { top + gap * 5.0 } else { top + gap * 4.0 };
                 let row_y = row_y + if self.config.upscaler > 0 && !compact { 20.0 } else { 0.0 };
                 ui.push(UiOp::text(w / 2.0 - 320.0, row_y + bh / 2.0 - 8.0, 17.0, DIM_C, &t(self.lang, OPT_RT).replace("[T] ", "")));
-                let rt_items: [(u8, &str); 3] = [
+                let rt_items: [(u8, &str); 4] = [
                     (0, t(self.lang, RT_OFF)),
                     (1, t(self.lang, UP_QUALITY)),
                     (2, t(self.lang, RT_ULTRA).split(" — ").next().unwrap_or("Ultra")),
+                    (3, "Overdrive"),
                 ];
                 for (i, (v, label)) in rt_items.iter().enumerate() {
                     let state = if self.config.rt_mode == *v { BtnState::Selected } else { BtnState::Normal };
-                    self.button(ui, &font, BtnAction::Rt(*v), w / 2.0 - 100.0 + i as f32 * 110.0, row_y, 104.0, bh, label, state);
+                    self.button(ui, &font, BtnAction::Rt(*v), w / 2.0 - 215.0 + i as f32 * 110.0, row_y, 104.0, bh, label, state);
                 }
 
                 let back_y = (row_y + bh + if compact { 14.0 } else { 30.0 }).max(h * 0.86);

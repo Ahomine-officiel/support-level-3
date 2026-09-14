@@ -163,15 +163,20 @@ Trois modes (mémorisés dans `sl3_config.json`) :
 | Mode | Effets | Coût |
 |---|---|---|
 | **Off** (défaut) | rendu classique identique à la v2 | zéro |
-| **Qualité** | ombres douces des néons (pénombres stables) + ombre de la torche + occlusion ambiante lissée + **réflexions des néons sur le sol** | tampon RT à 40 % de la résolution |
-| **Ultra** | + un rebond de lumière (GI approximatif) + AO à 3 rayons | tampon RT à 50 % |
+| **Qualité** | ombres douces des néons (pénombres stables) + ombre de la torche + occlusion ambiante lissée + **réflexions pleine scène** (le couloir se reflète dans le lino) + rebond de lumière | tampon RT à 40 % de la résolution |
+| **Ultra** | + GI plus forte + AO à 3 rayons | tampon RT à 50 % |
 
 Lisibilité garantie : l'AO ne descend jamais sous 0,45 et l'ambiance n'est pas
 écrasée — une scène sans lumière reste sombre mais lisible en RT (avant, tout
 partait au noir). Aucun filtre « artificiel » plaqué : le RT n'ajoute que de la
-lumière physiquement plausible (ombres douces, rebonds, reflets spéculaires —
-fini les taches d'AO boueuses à un seul rayon : Qualité multiplie les
-échantillons et compresse la plage).
+lumière physiquement plausible (ombres douces, rebonds, reflets spéculaires).
+Le rayon miroir **trace toute la scène** : le point réfléchi est ré-éclairé
+(ambiance + néons + torche, avec ombre portée de la lumière dominante) puis
+fondu dans le brouillard — le sol ciré renvoie le couloir, les portes et la
+traînée de votre propre lampe. Les néons ne peuvent plus s'auto-ombrer (les
+boîtes contenant la lumière sont ignorées par les rayons d'ombre : fini les
+halos qui disparaissent en RT), et le jitter de pénombre reste sous la dalle
+du plafond (±0,12 m sous un plafond à 3 m).
 
 - **En jeu** : `F5` cycle les modes (message dans le journal) — la ligne perf
   affiche `· RT` quand c'est actif.

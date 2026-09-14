@@ -117,6 +117,10 @@ pub const BOTS_LABEL: usize = 90;
 pub const LOCAL_NOTE: usize = 91;
 pub const E_LOCAL_SERVER: usize = 92;
 pub const BOTS_SUB: usize = 93;
+pub const RT_OVERDRIVE: usize = 94;
+pub const RT_TAG_Q: usize = 95;
+pub const RT_TAG_U: usize = 96;
+pub const RT_TAG_OD: usize = 97;
 
 pub fn t(lang: Lang, key: usize) -> &'static str {
     let (fr, en) = TEXTS[key];
@@ -335,4 +339,12 @@ pub const TEXTS: &[(&str, &str)] = &[
     ("Serveur local impossible", "Local server failed"),
     // 93
     ("équipiers IA qui réparent les serveurs", "AI teammates repairing servers"),
+    // 94
+    ("Overdrive — path tracing", "Overdrive — path tracing"),
+    // 95
+    ("RT Qualité", "RT Quality"),
+    // 96
+    ("RT Ultra", "RT Ultra"),
+    // 97
+    ("RT Overdrive", "RT Overdrive"),
 ];

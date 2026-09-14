@@ -650,8 +650,8 @@ impl Game {
                 } else {
                     1.0
                 };
-                u.light_pos[n] = [l.pos.x, l.pos.y, l.pos.z, 7.5];
-                u.light_col[n] = [l.color[0], l.color[1], l.color[2], 0.85 * on];
+                u.light_pos[n] = [l.pos.x, l.pos.y, l.pos.z, 9.0];
+                u.light_col[n] = [l.color[0], l.color[1], l.color[2], 1.5 * on];
                 n += 1;
             }
         }

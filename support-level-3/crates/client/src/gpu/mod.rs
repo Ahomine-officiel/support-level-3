@@ -120,6 +120,9 @@ pub struct RtParams {
     pub counts: [f32; 4],
     /// x : force GI (0 = désactivée) · y : AO appliquée à la lumière directe.
     pub misc: [f32; 4],
+    /// Path tracing : x : rayons GI par pixel · y : rebonds · z : budget ombres
+    /// (0 = sans ombre, 1 = lumière dominante, 2 = toutes les lumières) · w : échantillons de réflexion.
+    pub pt: [f32; 4],
 }
 
 /// Données par frame nécessaires au ray tracing (None = RT désactivé).
@@ -232,7 +235,7 @@ pub struct Renderer {
     capture_tex: Option<wgpu::Texture>,
 
     // ----- Ray tracing optionnel -----
-    /// 0 = désactivé, 1 = qualité (ombres + AO), 2 = ultra (+ rebond GI).
+    /// 0 = désactivé, 1 = qualité (ombres + AO), 2 = ultra (+ GI 2 rebonds), 3 = overdrive (path tracing).
     pub rt_mode: u8,
     /// Échelle du tampon RT relativement au tampon monde.
     rt_scale: f32,
@@ -286,6 +289,11 @@ impl Renderer {
             None,
         ))
         .expect("création device");
+
+        // Les erreurs wgpu sans handler sont avalées en silence : les rendre visibles.
+        device.on_uncaptured_error(Box::new(|e| {
+            eprintln!("[wgpu-error] {e}");
+        }));
 
         let caps = surface.get_capabilities(&adapter);
         let format = caps
@@ -996,7 +1004,9 @@ impl Renderer {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba16Float,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC, // debug dump rt0/rt1
             view_formats: &[],
         });
         let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
@@ -1245,17 +1255,33 @@ impl Renderer {
 
     // ---------- ray tracing (optionnel) ----------
 
-    /// Échelle du tampon RT selon le mode : qualité 0.4x, ultra 0.5x du tampon monde.
+    /// Échelle du tampon RT selon le mode : qualité 0.4x, ultra 0.5x, overdrive 0.6x.
     fn rt_target_scale(mode: u8) -> f32 {
         match mode {
             2 => 0.5,
+            3 => 0.6,
             _ => 0.4,
         }
     }
 
-    /// Change de mode RT (0 désactivé / 1 qualité / 2 ultra) et recrée ce qu'il faut.
+    /// Nombre approximatif de rayons lancés par pixel (miroir du budget du shader).
+    /// Affiché dans le tag perf : c'est la preuve quantifiée que de VRAIS rayons
+    /// sont lancés (et le coût se voit immédiatement sur lavapipe).
+    pub fn rt_ray_count(mode: u8) -> u32 {
+        match mode {
+            // ombres néons ~2 + torche 1 + AO 1 + réflexion 2 + GI 1×(1 trace)
+            1 => 7,
+            // ombres 3 + AO 3 + réflexion 2 + GI 2×(2 traces + 1 ombre)
+            2 => 14,
+            // ombres 3 + AO 3 + réflexions 2×2 + GI 2×(3 traces + 3 ombres)
+            3 => 26,
+            _ => 0,
+        }
+    }
+
+    /// Change de mode RT (0 désactivé / 1 qualité / 2 ultra / 3 overdrive path tracing).
     pub fn set_rt_mode(&mut self, mode: u8) {
-        let mode = mode.min(2);
+        let mode = mode.min(3);
         if mode == self.rt_mode {
             return;
         }
@@ -1315,6 +1341,7 @@ impl Renderer {
             rtscene::build_static_boxes(map, insts, |name| models.get(name).map(|m| m.bounds))
         };
         self.rt_static_count = boxes.len() as u32;
+        println!("[rt] update_rt_statics : {} boîtes (statiques)", boxes.len());
         let mut padded = boxes;
         padded.resize(rtscene::MAX_RT_STATIC_BOXES, rtscene::GpuAabb::ZERO);
         self.queue.write_buffer(&self.rt_static_buf, 0, bytemuck::cast_slice(&padded));
@@ -1496,11 +1523,21 @@ impl Renderer {
                     1.6,
                 ],
                 misc: [
-                    if self.rt_mode >= 2 { 0.55 } else { 0.0 },
+                    match self.rt_mode {
+                        2 => 0.85,
+                        3 => 1.15,
+                        _ => 0.4,
+                    }, // force GI
                     0.35,
                     if self.rt_mode >= 2 { 3.0 } else { 1.0 }, // échantillons AO
                     0.0,
                 ],
+                // Path tracing : (échantillons GI, rebonds, budget ombres, échantillons réflexion)
+                pt: match self.rt_mode {
+                    2 => [2.0, 2.0, 1.0, 1.0],
+                    3 => [2.0, 3.0, 2.0, 2.0],
+                    _ => [1.0, 1.0, 0.0, 1.0],
+                },
             };
             self.queue.write_buffer(&self.rt_params_buf, 0, bytemuck::bytes_of(&params));
             let mut boxes: Vec<rtscene::GpuAabb> = f
@@ -1515,6 +1552,9 @@ impl Renderer {
 
         // Quads UI.
         let (verts, draws) = ui::build_ui_verts(ui_ops, &self.font);
+
+        // Debug : buffers de lecture rt0/rt1 copiés DANS le même encoder (ordre garanti).
+        let mut staged_rt: Option<Vec<(wgpu::Buffer, u32, u32, u64)>> = None;
         if !verts.is_empty() {
             let bytes_needed = (verts.len() * std::mem::size_of::<ui::UiVertex>()) as u64;
             if self.ui_buf.size() < bytes_needed {
@@ -1598,6 +1638,52 @@ impl Renderer {
                 pass.set_pipeline(&self.rt_pipeline);
                 pass.set_bind_group(0, &self.rt_bind, &[]);
                 pass.draw(0..3, 0..1);
+                static RT_FRAMES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                let n = RT_FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n < 3 || n % 25 == 0 {
+                    eprintln!(
+                        "[rt] passe {} : tampon {}x{}, statiques {}, dynamiques {}",
+                        n,
+                        self.rt0_tex.size().width,
+                        self.rt0_tex.size().height,
+                        self.rt_static_count,
+                        self.rt_dyn_buf.size() / std::mem::size_of::<rtscene::GpuAabb>() as u64
+                    );
+                }
+                // Copie de lecture immédiate (debug dump) : ordre queue garanti.
+                if std::env::var("SL3_RT_DUMP").is_ok() {
+                    let mut staged = Vec::new();
+                    for tex in [&self.rt0_tex, &self.rt1_tex] {
+                        let size = tex.size();
+                        let (w, h) = (size.width, size.height);
+                        let bpr = (w * 8).div_ceil(256) * 256;
+                        let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                            label: Some("rt-read"),
+                            size: (bpr * h) as u64,
+                            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                            mapped_at_creation: false,
+                        });
+                        encoder.copy_texture_to_buffer(
+                            wgpu::ImageCopyTexture {
+                                texture: tex,
+                                mip_level: 0,
+                                origin: wgpu::Origin3d::ZERO,
+                                aspect: wgpu::TextureAspect::All,
+                            },
+                            wgpu::ImageCopyBuffer {
+                                buffer: &buf,
+                                layout: wgpu::ImageDataLayout {
+                                    offset: 0,
+                                    bytes_per_row: Some(bpr),
+                                    rows_per_image: Some(h),
+                                },
+                            },
+                            size,
+                        );
+                        staged.push((buf, w, h, bpr as u64));
+                    }
+                    staged_rt = Some(staged);
+                }
             }
             {
                 let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1834,8 +1920,75 @@ impl Renderer {
         frame.present();
         if let Some(path) = capture_path {
             self.save_capture(&path);
+            // Debug QA : SL3_RT_DUMP=1 exporte aussi rt0 (ao/ombres) et rt1 (gi/réflexions).
+            if self.rt_mode > 0 && std::env::var("SL3_RT_DUMP").is_ok() {
+                if let Some(staged) = staged_rt {
+                    self.dump_rt(&path, &staged);
+                }
+            }
         }
         Ok(())
+    }
+
+    /// f16 (rgba16float) -> f32, décodeur minimal pour l'export debug.
+    fn f16_to_f32(h: u16) -> f32 {
+        let sign = ((h >> 15) & 1) as f32;
+        let exp = ((h >> 10) & 0x1f) as i32;
+        let frac = (h & 0x3ff) as f32;
+        if exp == 0 {
+            return sign * frac * 2f32.powi(-24); // sous-normaux
+        }
+        if exp == 31 {
+            return f32::INFINITY;
+        }
+        sign * (1.0 + frac / 1024.0) * 2f32.powi(exp - 15)
+    }
+
+    /// Exporte rt0/rt1 en PNG (lecture bloquante) : diagnostique la passe RT
+    /// sans deviner — ao/ombres/torche d'un côté, gi/réflexions de l'autre.
+    fn dump_rt(&self, path: &std::path::Path, staged: &[(wgpu::Buffer, u32, u32, u64)]) {
+        for (name, s) in [("rt0", &staged[0]), ("rt1", &staged[1])] {
+            let (buf, w, h, bpr) = (&s.0, s.1, s.2, s.3);
+            let (tx, rx) = std::sync::mpsc::channel();
+            buf.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+                let _ = tx.send(r);
+            });
+            let _ = self.device.poll(wgpu::Maintain::Wait);
+            if rx.recv().is_err() {
+                continue;
+            }
+            let data = buf.slice(..).get_mapped_range();
+            let mut mn = f32::MAX;
+            let mut mx = f32::MIN;
+            let mut px: Vec<u8> = Vec::with_capacity((w * h * 3) as usize);
+            for row in 0..h {
+                let base = (row * bpr) as usize;
+                for col in 0..w {
+                    let o = base + (col * 8) as usize;
+                    for c in 0..3usize {
+                        let bits = u16::from_le_bytes([data[o + c * 2], data[o + c * 2 + 1]]);
+                        let v = Self::f16_to_f32(bits);
+                        mn = mn.min(v);
+                        mx = mx.max(v);
+                        let v = v.clamp(0.0, 1.0);
+                        // boost ×4 pour la lisibilité (les valeurs RT sont sombres)
+                        px.push((v.min(0.25) * 1020.0) as u8);
+                    }
+                }
+            }
+            drop(data);
+            buf.unmap();
+            println!("[rt-dump] {name} : min={mn:.4} max={mx:.4}");
+            let mut img = image::RgbImage::new(w, h);
+            for (i, p) in px.chunks(3).enumerate() {
+                img.put_pixel((i as u32) % w, (i as u32) / w, image::Rgb([p[0], p[1], p[2]]));
+            }
+            let stem = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+            let dir = path.parent().map(|d| d.to_path_buf()).unwrap_or_default();
+            let out = dir.join(format!("{stem}_{name}.png"));
+            let _ = img.save(&out);
+            println!("[rt-dump] {out:?}");
+        }
     }
 
     /// Écrit la texture de capture dans un PNG (lecture bloquante one-shot).
