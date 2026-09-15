@@ -1040,6 +1040,10 @@ impl Renderer {
         self.depth_view = dv;
         self.rebuild_rt_bind();
         self.recreate_rt_targets();
+        // Les cibles RT viennent d'être remplacées : le bind group du MONDE
+        // doit suivre, sinon il échantillonne les anciennes textures (vues
+        // orphelines) → rt0/rt1 lus NOIRS en jeu (« le RT éteint tout »).
+        self.rebuild_world_bind();
         self.recreate_ups_targets();
         self.reset_upscale = true;
     }
@@ -1525,7 +1529,8 @@ impl Renderer {
                 misc: [
                     match self.rt_mode {
                         2 => 0.85,
-                        3 => 1.15,
+                        3 => 1.55, // NEE avec ombres portées : collecte moins que
+                                   // la GI non-ombrée de Qualité -> on compense
                         _ => 0.4,
                     }, // force GI
                     0.35,
@@ -1650,8 +1655,17 @@ impl Renderer {
                         self.rt_dyn_buf.size() / std::mem::size_of::<rtscene::GpuAabb>() as u64
                     );
                 }
-                // Copie de lecture immédiate (debug dump) : ordre queue garanti.
-                if std::env::var("SL3_RT_DUMP").is_ok() {
+                drop(pass); // fin de la passe : l'encodeur redevient utilisable
+            }
+            // Copie de lecture (debug dump) : APRÈS la fin de la passe (une
+            // copie pendant une passe active invalide l'encodeur sous wgpu 22).
+            // Déclenchée sur la frame de capture EN JEU (données de CETTE frame).
+            if std::env::var("SL3_RT_DUMP").is_ok()
+                && self.rt_static_count > 0
+                && capture_path.is_some()
+            {
+                static DUMPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                if !DUMPED.swap(true, std::sync::atomic::Ordering::Relaxed) {
                     let mut staged = Vec::new();
                     for tex in [&self.rt0_tex, &self.rt1_tex] {
                         let size = tex.size();
@@ -1932,7 +1946,9 @@ impl Renderer {
 
     /// f16 (rgba16float) -> f32, décodeur minimal pour l'export debug.
     fn f16_to_f32(h: u16) -> f32 {
-        let sign = ((h >> 15) & 1) as f32;
+        // signe : bit 15 → -1.0 / 1.0 (un signe 0/1 multipliait tout positif
+        // par 0.0 : le dump affichait « tout à zéro » alors que la passe écrivait).
+        let sign = if (h >> 15) & 1 == 1 { -1.0 } else { 1.0 };
         let exp = ((h >> 10) & 0x1f) as i32;
         let frac = (h & 0x3ff) as f32;
         if exp == 0 {
@@ -1962,7 +1978,7 @@ impl Renderer {
             let mut mx = f32::MIN;
             let mut px: Vec<u8> = Vec::with_capacity((w * h * 3) as usize);
             for row in 0..h {
-                let base = (row * bpr) as usize;
+                let base = (row as u64 * bpr) as usize;
                 for col in 0..w {
                     let o = base + (col * 8) as usize;
                     for c in 0..3usize {

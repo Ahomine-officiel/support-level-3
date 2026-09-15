@@ -83,4 +83,10 @@ pub fn blackout_bounds() -> (f32, f32) {
         .unwrap_or(BLACKOUT_INTERVAL_MAX);
     (min, max.max(min))
 }
+
+/// SL3_AUDITOR=0 — désactive l'IA de l'Auditeur (tests/QA : captures de rendu
+/// sans que l'entité ne déplace le regard du joueur pendant les scénarios).
+pub fn auditor_enabled() -> bool {
+    std::env::var("SL3_AUDITOR").ok().map(|v| v != "0").unwrap_or(true)
+}
 pub const BLACKOUT_DURATION: f32 = 22.0;

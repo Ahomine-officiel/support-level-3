@@ -88,7 +88,7 @@ fn fs(in: VSOut) -> @location(0) vec4<f32> {
         let lc = u.light_col[i];
         let to = lp.xyz - in.wpos;
         let d = max(length(to), 0.001);
-        let att = smoothstep(lp.w, lp.w * 0.2, d);
+        let att = 1.0 - clamp(d / max(lp.w, 0.001), 0.0, 1.0); // linéaire bornée (cf. rt.wgsl)
         let nl = max(dot(n, to / d), 0.0);
         light = light + lc.rgb * lc.w * nl * att * att * sh * mix(1.0, ao, 0.35);
     }

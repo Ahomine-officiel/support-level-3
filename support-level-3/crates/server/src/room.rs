@@ -533,8 +533,10 @@ fn tick(g: &mut Game) {
         }
     }
 
-    // 4) IA de l'Auditeur.
-    ai::update(g, TICK_DT);
+    // 4) IA de l'Auditeur (désactivable pour la QA via SL3_AUDITOR=0).
+    if sl3_shared::consts::auditor_enabled() {
+        ai::update(g, TICK_DT);
+    }
 
     // 4bis) La sortie s'ouvre dès que les deux objectifs sont remplis.
     check_exit(g);

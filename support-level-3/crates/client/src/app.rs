@@ -109,6 +109,7 @@ fn parse_key(name: &str) -> Option<KeyCode> {
         "F6" => KeyCode::F6,
         "KeyF" | "F" => KeyCode::KeyF,
         "KeyE" | "E" => KeyCode::KeyE,
+        "KeyT" | "T" => KeyCode::KeyT,
         "KeyW" | "W" | "KeyZ" | "Z" => KeyCode::KeyW,
         "KeyA" | "A" | "KeyQ" | "Q" => KeyCode::KeyA,
         "KeyS" | "S" => KeyCode::KeyS,
@@ -231,7 +232,12 @@ pub struct App {
     last_frame: Instant,
     err: Option<(Instant, String)>,
     /// Moyenne glissante du temps de frame (pour la résolution dynamique).
+    /// Basée sur le temps MUR réel (non clampé) : sous lavapipe une frame
+    /// peut durer 3 s — clampée à 0.1, le compteur FPS aurait menti (x10).
     ema_frame: f32,
+    /// Derniers temps de frame mur (fenêtre glissante du bench : FPS fidèle
+    /// même à basse cadence, où l'EMA mettrait des dizaines de frames à converger).
+    bench_dts: std::collections::VecDeque<f32>,
     last_scale_adj: Instant,
     audio: Option<Audio>,
     map: Option<&'static MapData>,
@@ -276,6 +282,7 @@ impl App {
             last_frame: Instant::now(),
             err: None,
             ema_frame: 1.0 / 60.0,
+            bench_dts: std::collections::VecDeque::new(),
             last_scale_adj: Instant::now(),
             audio,
             map: None,
@@ -984,12 +991,26 @@ impl App {
             return;
         }
         self.handle_net_events();
-        let dt = self.last_frame.elapsed().as_secs_f32().min(0.1);
+        // Temps MUR réel pour la mesure de perf (jamais clampé) ; le dt de
+        // simulation reste clampé à 0.1 pour la stabilité du jeu.
+        let wall_dt = self.last_frame.elapsed().as_secs_f32();
+        let dt = wall_dt.min(0.1);
         self.last_frame = Instant::now();
+
+        // Fenêtre glissante du bench (8 dernières frames complètes).
+        // Uniquement des frames EN JEU : hors partie on vide (sinon les frames
+        // rapides des menus pollueraient la moyenne du mode Overdrive).
+        if !matches!(self.mode, Mode::Playing) {
+            self.bench_dts.clear();
+        }
+        self.bench_dts.push_back(wall_dt);
+        while self.bench_dts.len() > 8 {
+            self.bench_dts.pop_front();
+        }
 
         // Résolution dynamique : adapte l'échelle de rendu au temps de frame réel
         // (cible ~60 fps ; plafond 1.0, plancher 0.45) — pensé pour iGPU / vieilles machines.
-        self.ema_frame = self.ema_frame * 0.92 + dt * 0.08;
+        self.ema_frame = self.ema_frame * 0.92 + wall_dt * 0.08;
         if let Some(r) = self.renderer.as_mut() {
             if self.config.render_scale <= 0.0 {
                 if self.last_scale_adj.elapsed().as_secs_f32() > 0.75 {
@@ -1073,6 +1094,19 @@ impl App {
                         Some(r) => g.rt_dynamic_boxes(&r.models),
                         None => Vec::new(),
                     };
+                    if std::env::var("SL3_RT_BOXES").is_ok() {
+                        static ONCE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                        let n = ONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if n < 2 {
+                            eprintln!("[rt-boxes] {} boîtes dynamiques :", rt_boxes.len());
+                            for (i, b) in rt_boxes.iter().take(40).enumerate() {
+                                eprintln!(
+                                    "  [{i}] lo=({:.1},{:.1},{:.1}) hi=({:.1},{:.1},{:.1})",
+                                    b.lo[0], b.lo[1], b.lo[2], b.hi[0], b.hi[1], b.hi[2]
+                                );
+                            }
+                        }
+                    }
                     let post = g.post_params();
                     (wu, post, dyns, g.fear, inv_vp, rt_boxes)
                 };
@@ -1083,7 +1117,9 @@ impl App {
                     hud::draw(&mut ui_ops, g, &font, self.lang, (w, h));
                 }
                 // Ligne perf (haut-droite) : FPS + échelle de rendu + indicateur RT/upscaling.
-                let fps = (1.0 / self.ema_frame.max(1e-4)) as u32;
+                // Sous 10 FPS on garde une décimale (un « 0 FPS » entier ne dit rien).
+                let fps_val = 1.0 / self.ema_frame.max(1e-4);
+                let fps_str = if fps_val < 10.0 { format!("{fps_val:.1}") } else { format!("{}", fps_val as u32) };
                 let renderer = self.renderer.as_ref().unwrap();
                 let internal_pct = ((renderer.render_scale()
                     * if renderer.ups_active() {
@@ -1116,7 +1152,7 @@ impl App {
                     String::new()
                 };
                 let perf = format!(
-                    "{fps} FPS – rendu {internal_pct}%{rt_tag}{ups_tag}"
+                    "{fps_str} FPS – rendu {internal_pct}%{rt_tag}{ups_tag}"
                 );
                 let tw = crate::gpu::ui::text_width(&font, &perf, 13.0);
                 ui_ops.push(UiOp::text(w - tw - 12.0, 10.0, 13.0, [0.62, 0.68, 0.62, 0.75], &perf));
@@ -1514,9 +1550,24 @@ impl App {
                     }
                     if std::env::var("SL3_DEBUG").is_ok() {
                         if let Some(g) = &self.game {
-                            eprintln!("[sl3-debug] pos=({:.1},{:.1}) yaw={:.2}", g.pos.x, g.pos.z, g.yaw);
+                            eprintln!("[sl3-debug] pos=({:.2},{:.2},{:.2}) yaw={:.2} pitch={:.2}", g.pos.x, g.pos.y, g.pos.z, g.yaw, g.pitch);
                         }
                     }
+                    // Mesure de perf horodatée : FPS sur la fenêtre glissante
+                    // (8 dernières frames complètes, temps mur) + mode RT +
+                    // budget de rayons. Preuve chiffrée du coût des rayons.
+                    let (fps, win) = if self.bench_dts.len() >= 2 {
+                        let sum: f32 = self.bench_dts.iter().sum();
+                        let n = self.bench_dts.len() as f32;
+                        (n / sum.max(1e-4), sum * 1000.0 / n)
+                    } else {
+                        (1.0 / self.ema_frame.max(1e-4), self.ema_frame * 1000.0)
+                    };
+                    let mode = self.renderer.as_ref().map(|r| r.rt_mode).unwrap_or(0);
+                    eprintln!(
+                        "[bench] fps={fps:.2} rt_mode={mode} rays_px={} frame_ms_moyen={win:.0}",
+                        crate::gpu::Renderer::rt_ray_count(mode),
+                    );
                 }
                 AutoAct::Yaw(a) => {
                     if let Some(g) = self.game.as_mut() {

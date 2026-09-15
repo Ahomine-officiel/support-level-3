@@ -10,6 +10,7 @@ cd /home/z/my-project/support-level-3
 export SL3_WINDOW_SIZE=1280x720
 export SL3_BLACKOUT_MIN=10000
 export SL3_BLACKOUT_MAX=10020
+export SL3_AUDITOR=0
 export VK_ICD_FILENAMES="$HOME/.local-mesa/usr/share/vulkan/icd.d/lvp_icd.json"
 export LD_LIBRARY_PATH="$HOME/.local-mesa/usr/lib/x86_64-linux-gnu:$HOME/.local-x11/usr/lib/x86_64-linux-gnu:$HOME/.local-alsa/usr/lib/x86_64-linux-gnu"
 export MESA_GL_VERSION_OVERRIDE=4.5
@@ -28,7 +29,7 @@ EOF
 
 # Chronologie généreuse : lavapipe rend 0.5-6 s/frame en jeu (overdrive le plus lent).
 # yaw 90 = le long du couloir (forward = (sin yaw, _, cos yaw) -> +x).
-SCENARIO="click 640 310@6; key Enter@11; click 640 554@18; tp 41 43@30; yaw 90@32; look 0 82@34; shot $SHOT@46; exit@49"
+SCENARIO="click 640 310@6; click 482 392@8; key Enter@11; click 640 554@18; tp 41 43@30; yaw 90@32; look 0 -18@34; shot $SHOT@70; exit@73"
 export SL3_DEBUG=1
 
 bash /home/z/my-project/scripts/run_headless.sh "$SCENARIO" ./target/release/sl3-client /tmp/sl3_rt_${TAG}.log

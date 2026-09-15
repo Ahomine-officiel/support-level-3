@@ -217,7 +217,10 @@ fn wpos_from_depth(uv: vec2<f32>, d: f32) -> vec3<f32> {
 
 /// Direction cosinus-autour de n (échantillonnage Monte Carlo diffus).
 fn cosine_hemi(n: vec3<f32>, u1: f32, u2: f32) -> vec3<f32> {
-    let up = select(vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(1.0, 0.0, 0.0), abs(n.y) > 0.9);
+    // up = l'axe le PLUS ORTHOGONAL à n : l'ancienne sélection (n.y > 0.9 ->
+    // up = x sinon z) donnait cross(n, up) = 0 pour n = ±Z exact (murs latéraux,
+    // normales d'AABB) -> normalize(0) = NaN -> GI entière NaN (inf en f16).
+    let up = select(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 0.0, 1.0), abs(n.z) < 0.9);
     let t = normalize(cross(n, up));
     let b = cross(n, t);
     let ang = u1 * 6.2831853;
@@ -259,7 +262,7 @@ fn neon_direct(p: vec3<f32>, n: vec3<f32>, budget: u32, px: vec2<i32>, salt: u32
         let to = lp.xyz - p;
         let dist = length(to);
         if (dist > lp.w || dist < 0.05) { continue; }
-        let att = smoothstep(lp.w, lp.w * 0.2, dist);
+        let att = 1.0 - clamp(dist / max(lp.w, 0.001), 0.0, 1.0); // linéaire bornée (l'ancien smoothstep à bords inversés explosait au loin -> inf en f16)
         let nl = max(dot(n, to / max(dist, 0.001)), 0.0);
         let w = lc.w * att * att * nl;
         if (w <= 0.004) { continue; }
@@ -373,7 +376,7 @@ fn fs(in: VSOut) -> FSOut {
         let to = lp.xyz - p;
         let dist = length(to);
         if (dist > lp.w || dist < 0.05) { continue; }
-        let att = smoothstep(lp.w, lp.w * 0.2, dist);
+        let att = 1.0 - clamp(dist / max(lp.w, 0.001), 0.0, 1.0); // linéaire bornée (l'ancien smoothstep à bords inversés explosait au loin -> inf en f16)
         let w = lc.w * att * att * max(dot(n, to / max(dist, 0.001)), 0.0);
         if (w <= 0.004) { continue; }
         // Jitter stable par pixel/lumière : pénombre sans scintillement.
@@ -446,8 +449,8 @@ fn fs(in: VSOut) -> FSOut {
                 let dir_w = cosine_hemi(sn, u1, u2);
                 var hn = vec3<f32>(0.0, 1.0, 0.0);
                 let t = trace(sp, dir_w, 34.0, &hn);
-                if (t < 0.0) {
-                    break; // le chemin s'échappe dans le lieu : plus rien à collecter
+                if (t < 0.0 || t != t) {
+                    break; // échappé OU NaN (t != t) : on arrête le chemin
                 }
                 let hp = sp + dir_w * t;
                 let alb = surface_albedo(hn, hp);

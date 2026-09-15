@@ -158,13 +158,50 @@ structures : autre projet. En pratique, sur une scène intérieure simple comme
 ici, le rendu est le même — c'est le même algorithme d'intersection,
 accéléré par des GPU units différentes.
 
-Trois modes (mémorisés dans `sl3_config.json`) :
+Quatre modes (mémorisés dans `sl3_config.json`) :
 
-| Mode | Effets | Coût |
-|---|---|---|
-| **Off** (défaut) | rendu classique identique à la v2 | zéro |
-| **Qualité** | ombres douces des néons (pénombres stables) + ombre de la torche + occlusion ambiante lissée + **réflexions pleine scène** (le couloir se reflète dans le lino) + rebond de lumière | tampon RT à 40 % de la résolution |
-| **Ultra** | + GI plus forte + AO à 3 rayons | tampon RT à 50 % |
+| Mode | Effets | Budget de rayons | Tampon RT |
+|---|---|---|---|
+| **Off** (défaut) | rendu classique identique à la v2 | 0 r/px | — |
+| **Qualité** | ombres douces des néons (pénombres stables) + ombre de la torche + AO + **réflexions pleine scène** (le couloir se reflète dans le lino) + 1 rebond de GI (NEE non ombrée) | ~7 r/px | 40 % |
+| **Ultra** | + GI 2 rebonds avec ombre de la lumière dominante, AO 3 rayons, GI plus forte | ~14 r/px | 50 % |
+| **Overdrive** | **PATH TRACING Monte Carlo** : chemins complets 3 rebonds cosinus, next event estimation avec ombres portées à CHAQUE rebond (néons + torche), le même algorithme que le mode Overdrive de Cyberpunk 2077 — en compute plutôt que sur RT cores | ~26 r/px | 60 % |
+
+### 🔬 « T'es sûr que c'est des vrais rayons ? » — le bench qui tranche
+
+Le tag perf en haut à droite affiche `FPS – rendu X% – RT <mode> – N r/px` :
+les rayons lancés par pixel sont comptés, et le FPS **chute avec le budget de
+rayons**. Mesure reproductible (une seule partie, 1280×720, rendu natif 100 %,
+upscaler Off — seule variable : `F5` pour changer de mode RT en plein jeu),
+ici sur le rasterizer logiciel lavapipe où chaque rayon coûte du CPU :
+
+| Mode | FPS | Temps de frame | Écart |
+|---|---|---|---|
+| Off | 2,02 | 495 ms | — |
+| Qualité (7 r/px) | 1,58 | 634 ms | **+28 %** |
+| Ultra (14 r/px) | 0,88 | 1131 ms | **+129 %** |
+| Overdrive (26 r/px) | 0,60 | 1680 ms | **+239 %** |
+
+Le coût croît avec le nombre de rayons et de rebonds : c'est la signature
+d'un vrai traceur de rayons. Sur un GPU réel (RTX 2060+) l'écart absolu est
+plus faible car les rayons tournent sur des unités bien plus rapides — mais
+la hiérarchie est la même. Protocole : `SL3_AUTOPILOT="click 640 310@6; … key F5@30; shot …"`
+ou script `scripts/rt_ab_toggle.sh`.
+
+### 🆚 Et par rapport à Cyberpunk ?
+
+Cyberpunk 2077 (Overdrive) = DXR **matériel** : acceleration structures (BVH)
+sur des RT cores, des millions de triangles, un dénoiseur temporel dédié et
+une résolution interne réduite + DLSS. Notre Overdrive fait tourner **le même
+algorithme de path tracing** (rebonds cosinus + NEE ombrée) mais : scène
+simplifiée en ~100 boîtes (pas de BVH à parcourir — coût par rayon quasi
+constant), rayons sur les unités de calcul, et lissage par la résolution
+réduite + RCAS + brouillard au lieu d'un dénoiseur temporel. Le rendu est
+donc plus simple qu'un jeu AAA — le RT ajoute ombres douces, rebonds colorés,
+reflets pleine scène et l'ambiance physique, sans prétendre au niveau de
+détail géométrique d.un projet AAA.
+wgpu 22 n'expose pas DXR/VK_RT : du « RT matériel » = réécrire le moteur en
+Vulkan brut (ash) pour les acceleration structures.
 
 Lisibilité garantie : l'AO ne descend jamais sous 0,45 et l'ambiance n'est pas
 écrasée — une scène sans lumière reste sombre mais lisible en RT (avant, tout
