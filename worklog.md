@@ -213,3 +213,20 @@ Stage Summary:
 - Le « RT décevant » avait une cause mécanique (bind group monde orphelin après resize -> RT lu en noir) + un NaN dans cosine_hemi qui cassait Ultra/Overdrive : les deux corrigés, le RT rajoute à nouveau de la lumière (GI, reflets, halos) comme dans la passe 6-e.
 - Réponse Cyberpunk documentée dans le README : même algorithme de path tracing, scène simplifiée + compute au lieu de DXR/RT cores ; le vrai RT matériel nécessiterait Vulkan brut (hors wgpu 22).
 - Livrable : /home/z/my-project/download/support-level-3.zip (15,5 Mo).
+
+---
+Task ID: 7
+Agent: Super Z (main)
+Task: Push du projet vers GitHub (token fourni par l'utilisateur)
+
+Work Log:
+- Commit des modifications en attente (captures RT A/B, rt_ab_toggle.sh, zip) -> d2640f5
+- git gc --aggressive : .git compacte de 250 Mo -> 167.56 MiB (pack)
+- Repo distant existant vide detecte : Ahomine-officiel/support-level-3
+- Push full history main -> origin OK
+- Token retire de .git/config apres le push (remote URL propre)
+
+Stage Summary:
+- Code source complet (crates/, assets/, tools/), captures et zip disponibles sur
+  https://github.com/Ahomine-officiel/support-level-3 (branche main, HEAD d2640f5)
+- Note securite : token partage en clair dans le chat -> a revoquer apres usage
