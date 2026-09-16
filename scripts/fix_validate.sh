@@ -26,13 +26,15 @@ MODE="${1:-calm}"
 if [ "$MODE" = "calm" ]; then
   # Début CALME + souris + batterie :
   #   t=26  shot début de partie (calme=1 : site éclairé, grain ~invisible)
-  #   t=38  batterie : tp 2 cellules au sud, yaw 180 (face -Z), regard baissé
-  #   t=46  shot batterie (glow cyan visible)
-  #   t=48  look 500 px droite -> yaw doit DIMINUER (log yaw négatif)
-  #   t=54  shot après rotation (la scène doit avoir pivoté vers la droite)
+  #   t=36  tp (21,10) : la batterie 'b' la plus proche est à (21,7) -> 3 m nord
+  #   t=38  yaw +180 (face -Z, vers la batterie) ; t=40 regard baissé 24°
+  #   t=46  shot batterie (glow cyan + lévitation/rotation visibles)
+  #   t=48  look 500 px droite -> yaw doit DIMINUER (non inversé)
+  #   t=56  shot après rotation (la scène doit avoir pivoté vers la droite)
   export SL3_AUTOPILOT="click 640 310@6; click 482 392@8; key Enter@11; click 640 554@18; \
-shot $CAP/fix_calm_start.png@26; look 0 160@27; tp 21 11@36; yaw 180@38; \
-shot $CAP/fix_battery.png@46; yaw 180@48; look 500 0@49; shot $CAP/fix_look_right.png@56; exit@60"
+shot $CAP/fix_calm_start.png@26; tp 21 10@36; yaw 180@38; look 0 200@40; \
+shot $CAP/fix_battery.png@46; yaw 180@48; look 500 0@49; shot $CAP/fix_look_right.png@56; \
+tp 38 43@58; yaw 90@60; shot $CAP/fix_tex_wall.png@68; exit@72"
   bash $S/run_headless.sh "$SL3_AUTOPILOT" ./target/release/sl3-client /tmp/sl3_fix_calm.log
   grep -E "sl3-debug|autopilot" /tmp/sl3_fix_calm.log | tail -8
 else

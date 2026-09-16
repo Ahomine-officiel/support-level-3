@@ -393,7 +393,7 @@ impl Renderer {
             &device, &world_bind_layout, &mat_layout, &world_shader, format,
             false, wgpu::CompareFunction::LessEqual,
         );
-        let prepass_pipeline = Self::prepass_pipeline(&device, &world_bind_layout, &world_shader);
+        let prepass_pipeline = Self::prepass_pipeline(&device, &world_bind_layout, &mat_layout, &world_shader);
 
         // Post-process.
         let post_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -835,7 +835,7 @@ impl Renderer {
     }
 
     /// Pré-pass profondeur (vertex seul) pour la passe de ray tracing.
-    fn prepass_pipeline(device: &wgpu::Device, bind0: &wgpu::BindGroupLayout, bind1: &wgpu::BindGroupLayout, bind2: &wgpu::BindGroupLayout, shader: &wgpu::ShaderModule) -> wgpu::RenderPipeline {
+    fn prepass_pipeline(device: &wgpu::Device, bind0: &wgpu::BindGroupLayout, bind1: &wgpu::BindGroupLayout, shader: &wgpu::ShaderModule) -> wgpu::RenderPipeline {
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("prepass-pll"),
             bind_group_layouts: &[bind0, bind1],
@@ -1404,6 +1404,12 @@ impl Renderer {
             if insts.is_empty() {
                 continue;
             }
+            if model_name == "battery" && std::env::var("SL3_DEBUG").is_ok() {
+                // Positions réellement envoyées au GPU (colonne translation).
+                let trs: Vec<(f32, f32, f32)> =
+                    insts.iter().map(|i| (i.model.w_axis.x, i.model.w_axis.y, i.model.w_axis.z)).collect();
+                eprintln!("[sl3-debug] battery TRS: {trs:?}");
+            }
             let Some(model) = self.models.get(model_name) else { continue };
             for (pi, _part) in model.parts.iter().enumerate() {
                 let entry = groups
@@ -1460,7 +1466,26 @@ impl Renderer {
         // Dynamiques : même chemin que les statiques (buffer dédié par part,
         // créé hors encoder via create_buffer_init).
         if let Some(d) = dyns {
+            let dbg = std::env::var("SL3_DEBUG").is_ok();
             for (key, buf, count) in &d.batches {
+                if dbg {
+                    let mat = self
+                        .models
+                        .get(&key.model)
+                        .and_then(|m| m.parts.get(key.part))
+                        .map(|p| p.mat.clone())
+                        .unwrap_or_default();
+                    let has_bg = self
+                        .models
+                        .get(&key.model)
+                        .and_then(|m| m.parts.get(key.part))
+                        .map(|p| self.material_bind_groups.contains_key(&p.mat))
+                        .unwrap_or(false);
+                    eprintln!(
+                        "[sl3-debug] dyn draw: {} part={} n={} mat={:?} bg={}",
+                        key.model, key.part, count, mat, has_bg
+                    );
+                }
                 self.draw_part(pass, key, buf, *count);
             }
             let _ = &d.plan;

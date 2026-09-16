@@ -68,28 +68,25 @@ class Builder:
 
     # ---- boîte simple (murs/sols : tuiles exactes) ----
     def box(self, mat, size, t=(0, 0, 0), uv=None):
-        sx, sy, sz = (s * 0.5 for s in size)
+        hx, hy, hz = (s * 0.5 for s in size)
         x, y, z = t
         if uv is None:
             uv = lambda d: (d[0] / 2.0, d[1] / 2.0)
         elif isinstance(uv, (int, float)):
             uv = lambda d, uv=uv: (uv, uv)
-        hw, hh, hd = size
+        # Faces explicites : (normale hint, axe u, axe v, demi-span u, demi-span v, centre).
+        # Les demi-spans sont les DEMI-dimensions (l'ancien code mélangeait
+        # tailles pleines et moitiés -> boîtes géantes déformées).
         faces = [
-            (EX, (0, 1, 2), (hd, hh), (x + sx, y, z)),   # +X : (u,v)=(Z,Y)
-            (vmul(EX, -1), (2, 1, 0), (hd, hh), (x - sx, y, z)),
-            (EY, (2, 0, 1), (hw, hd), (x, y + sy, z)),   # +Y : (X,Z)
-            (vmul(EY, -1), (0, 1, 2), (hw, hd), (x, y - sy, z)),
-            (EZ, (0, 1, 2), (hw, hh), (x, y, z + sz)),   # +Z : (X,Y)
-            (vmul(EZ, -1), (1, 0, 2), (hw, hh), (x, y, z - sz)),
+            (EX, EZ, EY, hz, hy, (x + hx, y, z)),          # +X : (u,v)=(Z,Y)
+            (vmul(EX, -1), EZ, EY, hz, hy, (x - hx, y, z)),
+            (EY, EX, EZ, hx, hz, (x, y + hy, z)),          # +Y : (X,Z)
+            (vmul(EY, -1), EX, EZ, hx, hz, (x, y - hy, z)),
+            (EZ, EX, EY, hx, hy, (x, y, z + hz)),          # +Z : (X,Y)
+            (vmul(EZ, -1), EX, EY, hx, hy, (x, y, z - hz)),
         ]
-        for n_ax, perm, (a, b), c in faces:
-            u = [0.0, 0.0, 0.0]; v = [0.0, 0.0, 0.0]
-            u[perm[0]], v[perm[1]] = a, b
-            # base orthonormale avec u x v = n
-            if dot(cross(u, v), n_ax) < 0:
-                u, v = v, u
-            pts = [vadd(vadd(c, vmul(u, sa)), vmul(v, sv)) for (sa, sv) in ((-a, -b), (a, -b), (a, b), (-a, b))]
+        for n_ax, ua, va, a, b, c in faces:
+            pts = [vadd(vadd(c, vmul(ua, sa)), vmul(va, sv)) for (sa, sv) in ((-a, -b), (a, -b), (a, b), (-a, b))]
             uvs = [(0, 0), (uv((a * 2, b * 2))[0], 0), uv((a * 2, b * 2)), (0, uv((a * 2, b * 2))[1])]
             self.poly(mat, pts, uvs, n_ax)
 
@@ -119,11 +116,13 @@ class Builder:
             for si in (1, -1):
                 j, k = (i + 1) % 3, (i + 2) % 3
                 n = vmul(axes[i], si)
-                # base (u,v) avec u x v = n
+                # base (u,v) avec u x v = n ; les demi-spans (a,b) suivent
+                # l'échange (sinon ils restent collés aux mauvais axes -> boîtes déformées)
                 u, v = axes[j], axes[k]
+                a, b = ax[j] - c, ax[k] - c
                 if dot(cross(u, v), n) < 0:
                     u, v = v, u
-                a, b = ax[j] - c, ax[k] - c
+                    a, b = b, a
                 cen = vadd(ctr, vmul(axes[i], si * ax[i]))
                 pts = [vadd(vadd(cen, vmul(u, sa)), vmul(v, sv)) for (sa, sv) in ((-a, -b), (a, -b), (a, b), (-a, b))]
                 uu, vv = uvf((a * 2, b * 2))

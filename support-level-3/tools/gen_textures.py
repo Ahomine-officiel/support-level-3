@@ -144,12 +144,14 @@ a = pstains(a, 8, 18, seed=102, rmax=200)            # grandes auréoles
 # coulures d'eau verticales
 water = fbm(S, 103, 6, 4)
 a -= ((water > 0.62) * 22 * (water - 0.62) * 6)[..., None] * [0.7, 0.9, 1.0]
-# fissures périodiques
-for i in range(9):
+# fissures périodiques — DISCRÈTES : l'ancien rendu (9 fissures très
+# contrastées Δ36) ressortait en zigzags noirs à l'écran (« textures cassées »).
+# 4 fissures douces Δ16, à peine plus sombres que le béton.
+for i in range(4):
     x, y = rng.integers(0, S, 2)
-    for _ in range(rng.integers(5, 12)):
-        nx, ny = x + rng.integers(-40, 40), y + rng.integers(8, 60)
-        pline(a, x, y, nx, ny, (56, 58, 56), 1, seed=int(rng.integers(1 << 30)))
+    for _ in range(rng.integers(4, 8)):
+        nx, ny = x + rng.integers(-30, 30), y + rng.integers(8, 40)
+        pline(a, x, y, nx, ny, (76, 79, 76), 1, seed=int(rng.integers(1 << 30)))
         x, y = nx % S, ny % S
 # joints de coffrage horizontaux + trous de banche
 pgrid(a, S // 2, (70, 73, 70), 3)
@@ -157,7 +159,7 @@ for (px, py) in ((S // 8, S // 4), (S * 5 // 8, S * 3 // 4)):
     a[py - 5:py + 5, px - 5:px + 5] = (48, 48, 46)
     a[py - 3:py + 3, px - 3:px + 3] = (36, 36, 35)
 ao_edges(a, 8, 20)
-save(a, "concrete", blur=0.6)
+save(a, "concrete", blur=0.8)
 
 # ---------- béton sombre (piliers) ----------
 a = to_arr((72, 76, 74), S, 8, seed=110)

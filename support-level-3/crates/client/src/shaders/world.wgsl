@@ -69,7 +69,6 @@ const AMBIENT_CALME = vec3<f32>(0.16, 0.165, 0.18);
 
 @fragment
 fn fs(in: VSOut) -> @location(0) vec4<f32> {
-    if (in.emis.a > 2.0) { return vec4<f32>(1.0, 0.0, 1.0, 1.0); }
     let tex4 = textureSample(tex, samp, in.uv);
     let albedo = tex4.rgb * clamp(in.tint.rgb, vec3<f32>(0.0), vec3<f32>(2.0));
     let n = normalize(in.nrm);
@@ -112,7 +111,9 @@ fn fs(in: VSOut) -> @location(0) vec4<f32> {
         light = light + u.flash_col.rgb * u.flash_col.w * (spot * nl * att * att * 1.7 + 0.008) * shf;
     }
 
-    let emis = tex4.rgb * mat_u.w * in.emis.a * in.emis.rgb;
+    // Émissif : la couleur d'instance sert de PLANCHER (un pickup doit briller
+    // même si son albedo est sombre) ; la texture peut monter au-dessus.
+    let emis = max(tex4.rgb, in.emis.rgb * 0.9) * mat_u.w * in.emis.a;
     var color = albedo * light + albedo * gi + max(emis, vec3<f32>(0.0));
 
     let dist = length(in.wpos - u.cam_pos.xyz);

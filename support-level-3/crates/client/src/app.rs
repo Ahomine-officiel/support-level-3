@@ -1618,6 +1618,19 @@ impl App {
                         g.pos = Vec3::new(x, 0.0, z);
                         if std::env::var("SL3_DEBUG").is_ok() {
                             eprintln!("[sl3-debug] tp ({x},{z})");
+                            // Voisinage QA : solidité + type de sol autour du joueur.
+                            let (cc, cr) = (((x / 2.0).floor() as isize), ((z / 2.0).floor() as isize));
+                            for r in (cr - 2)..=(cr + 2) {
+                                let mut row = String::new();
+                                for c in (cc - 2)..=(cc + 2) {
+                                    if !g.map.in_bounds(c, r) || g.map.solid[g.map.idx(c as usize, r as usize)] {
+                                        row.push('#');
+                                    } else {
+                                        row.push('.');
+                                    }
+                                }
+                                eprintln!("[sl3-debug] map r{r}: {row}");
+                            }
                         }
                     }
                 }

@@ -51,6 +51,11 @@ impl Game {
         let statics = renderer.build_static(&insts);
         // Scène de ray tracing : murs fusionnés + mobilier (une fois par partie).
         renderer.update_rt_statics(map, &insts);
+        if std::env::var("SL3_DEBUG").is_ok() {
+            for (i, b) in map.batteries.iter().enumerate() {
+                eprintln!("[sl3-debug] battery[{i}] at ({:.2},{:.2},{:.2})", b.x, b.y, b.z);
+            }
+        }
         Game {
             map,
             my_id,
