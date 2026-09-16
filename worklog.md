@@ -230,3 +230,22 @@ Stage Summary:
 - Code source complet (crates/, assets/, tools/), captures et zip disponibles sur
   https://github.com/Ahomine-officiel/support-level-3 (branche main, HEAD d2640f5)
 - Note securite : token partage en clair dans le chat -> a revoquer apres usage
+
+---
+Task ID: 8
+Agent: Super Z (main)
+Task: Bugs joueur post-push — « la souris est inversée, les textures sont cassées, faut pas que ce soit un jeu d'horreur au début, pk pas utiliser raw input, la batterie est où (ni model ni texture ou alors elle est dans le mur) » + repush.
+
+Work Log:
+- ENV reconstruit (reset conteneur) : rustup 1.98.1, ALSA dev+runtime (~/.local-alsa, alsa.pc patché préfixe local, symlink libasound.so -> lib système), x11 (~/.local-x11), lavapipe 25.0.7 + ICD patché absolu, xauth. scripts/rebuild_env.sh créé (globs sur les .deb — les noms versionnés cassaient l'extraction).
+- SOURIS INVERSÉE (app.rs apply_look) : yaw += dx -> yaw -= dx. Géométrie : à yaw=0 le regard est +Z, la droite écran est -X (look_at_rh) ; pivoter vers la droite écran = yaw décroît. Raw input (DeviceEvent::MouseMotion, posé en 6-d) inchangé — le chemin est validé : look 500 px -> yaw 3.14 -> 2.04 rad (vision pivote vers l'EST, capture à l'appui).
+- TEXTURES « CASSÉES » — LA VRAIE CAUSE ÉTAIT LES MODÈLES, pas les textures : wall.bin/ceil.bin/floor_*.bin contenaient des boîtes GÉANTES déformées (wall : 18×18×8 m au lieu de 2×3×0.24 !) placées à CHAQUE cellule de mur -> le monde entier était rempli de méga-boîtes imbriquées, le joueur marchait À L'INTÉRIEUR, les salles étaient des parois grises à 1 m, et les pickups (batteries) étaient ENSEVELIS. Deux bugs dans tools/gen_models.py (v2) : (1) Builder.box() mélangeait tailles pleines et demi-tailles + perms d'axes faux (spans sur l'axe NORMAL) ; (2) Builder.chbox() échangeait u,v pour le winding SANS échanger (a,b) -> spans collés aux mauvais axes. Les deux réécrits proprement ; les 29 modèles régénérés et VÉRIFIÉS par un script de bornes (wall 2×3×0.24, pillar 0.62×3×0.62, rack 1.9×2.15, shelf 1.95×2.1, battery 0.12×0.21×0.06, tech 1.73 m, entity 2.17 m ; exit_door/exit_panel larges = par design, sortie multi-cellules).
+- BATTERIE « DANS LE MUR » (le joueur avait raison !) : elle existait et était envoyée au GPU (TRS (21,0.05,7) etc., bind group OK — debug build_dyn ajouté) mais ENSEVELIE dans les méga-boîtes. En plus : glow cyan émissif + lévitation (bob) + rotation + échelle 1.5 (6-e... commit 5e41e77) ; world.wgsl : ligne de DEBUG magenta (emis.a>2.0) supprimée, émissif = max(texture, couleur d'instance×0.9) × force × alpha (un pickup brille même si son albedo est sombre). Capture : batterie blanche-cyan flottante bien visible au centre de l'allée.
+- DÉBUT CALME (commit 5e41e77, re-validé) : uniform mood.x = calme (1.0 pendant 90 s, glisse vers l'horreur sur 60 s via smoothstep) ; AMBIENT_CALME 0.16-0.18, FOG_COLOR_CALME plus clair, néons +1.0 d'intensité et +6 m de portée au calme, nappe « ambience » 0.10 -> 0.10+0.45×peur, grain 0.008+0.035×peur (quasi invisible au repos), BLACKOUT repoussé à 150-240 s. Captures : site éclairé lisible, pas d'horreur à la première seconde.
+- VALIDATION (lavapipe + Xvfb + autopilot, captures relues) : fix_calm_start (spawn lisible, porte + murs + lino), fix_battery (pickup flottant visible), fix_look_right (rotation souris correcte), fix_tex_wall (béton doux, fissures discrètes), fix_rt_floor (RT Qualité 7 r/px : GI + halos néon + propres). Suite 16/16 verte, build release 0 warning.
+- REPUSH : commit 1bb6dac (avec 510903d + 5e41e77 du précédent push local) -> origin/main OK (d2640f5..1bb6dac), token non stocké dans .git/config. Zip re-packagé (15.3 Mo, 189 fichiers).
+
+Stage Summary:
+- Toutes les remontées joueur corrigées et vérifiées par captures : souris non inversée (raw input), monde intègre (la cause racine était les MODÈLES géants, pas les PNG), batterie visible/émissive/lévitante, début calme non-horreur.
+- Debug QA ajoutés (gated SL3_DEBUG) : [sl3-debug] battery TRS (positions GPU réelles), dyn draw (batchs/mats/bind groups), print des batteries au démarrage, voisinnage solid après tp.
+- GitHub à jour : https://github.com/Ahomine-officiel/support-level-3 (main, 1bb6dac). Zip : download/support-level-3.zip.
