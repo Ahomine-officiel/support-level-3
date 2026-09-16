@@ -558,7 +558,10 @@ impl App {
     fn apply_look(&mut self, dx: f64, dy: f64) {
         if let Some(g) = self.game.as_mut() {
             let sens = self.config.sensitivity;
-            g.yaw += (dx as f32) * 0.0022 * sens;
+            // Yaw NÉGATIF pour dx>0 : à yaw=0 le regard est +Z et la droite
+            // écran est -X (look_at_rh) — tourner la souris à droite doit
+            // pivoter le regard VERS la droite écran, donc yaw décroît.
+            g.yaw -= (dx as f32) * 0.0022 * sens;
             g.pitch -= (dy as f32) * 0.0022 * sens;
             g.pitch = g.pitch.clamp(-1.45, 1.45);
         }
@@ -665,7 +668,9 @@ impl App {
                     self.paused = false;
                     self.set_cursor_locked(true);
                     if let Some(a) = self.audio.as_mut() {
-                        a.start_loop("ambience", 0.5);
+                        // Début calme : pas de nappe angoissante dès la première
+                        // seconde — le drone d'ambiance monte avec la peur.
+                        a.start_loop("ambience", 0.10);
                         a.start_loop("fluorescent", 0.12);
                     }
                 }
@@ -1112,6 +1117,7 @@ impl App {
                 };
                 if let Some(a) = self.audio.as_ref() {
                     a.set_loop_volume("whisper", fear * 0.6);
+                    a.set_loop_volume("ambience", 0.10 + 0.45 * fear);
                 }
                 if let Some(g) = self.game.as_ref() {
                     hud::draw(&mut ui_ops, g, &font, self.lang, (w, h));
@@ -1191,6 +1197,8 @@ impl App {
                     None => empty_statics(),
                 };
                 let renderer = self.renderer.as_mut().unwrap();
+                // Instances dynamiques -> batches (mécanisme statique, hors encoder).
+                let dynb = renderer.build_dyn(&dyns);
                 let rt = if renderer.rt_mode > 0 {
                     Some(crate::gpu::RtFrame {
                         inv_vp,
@@ -1204,14 +1212,14 @@ impl App {
                 } else {
                     None
                 };
-                let _ = renderer.render(&wu, rt, statics, &dyns, &ui_ops, post, ups);
+                let _ = renderer.render(&wu, rt, statics, dynb.as_ref(), &ui_ops, post, ups);
             }
             None => {
                 let _ = self.renderer.as_mut().unwrap().render(
                     &identity_uniform(),
                     None,
                     empty_statics(),
-                    &Vec::new(),
+                    None,
                     &ui_ops,
                     [0.0, 0.0, 0.0, 0.0],
                     None,
@@ -1500,6 +1508,7 @@ fn identity_uniform() -> crate::gpu::WorldUniform {
         flash_dir: [0.0; 4],
         misc: [0.0; 4],
         flash_col: [0.0; 4],
+        mood: [1.0, 0.0, 0.0, 0.0],
     }
 }
 

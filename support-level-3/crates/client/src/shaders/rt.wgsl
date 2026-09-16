@@ -26,6 +26,8 @@ struct WorldU {
     flash_dir: vec4<f32>,
     misc: vec4<f32>,
     flash_col: vec4<f32>,
+    /// x = calme (1 début → 0 horreur), y = peur.
+    mood: vec4<f32>,
 };
 
 struct RtParams {
@@ -488,17 +490,19 @@ fn fs(in: VSOut) -> FSOut {
             let hp = ro2 + rdir * tr;
             // Le lieu réfléchi est ré-éclairé : ambiance + néons (NEE avec
             // l'ombre de la lumière dominante) + torche avec son rayon d'ombre.
-            let lit = vec3<f32>(0.035, 0.04, 0.055)
+            let lit = mix(vec3<f32>(0.035, 0.04, 0.055), vec3<f32>(0.16, 0.165, 0.18), u.mood.x)
                 + neon_direct(hp + hn2 * 0.012, hn2, 1u, px, 7u)
                 + torch_direct(hp + hn2 * 0.012, hn2);
             // Fondu avec la distance : le reflet s'évanouit dans le brouillard.
-            let fade = exp(-0.045 * tr);
-            refl = refl + lit * 0.38 * fade * rk;
+            let fade = exp(-0.09 * tr);
+            refl = refl + lit * 0.28 * fade * rk;
         }
 
         // 2) Reflets spéculaires des néons (sphères émissives pendants) —
-        //    cône gloss élargi sur les sols : traînées plus larges et vivantes.
-        let cone = select(0.86, 0.78, n.y > 0.5);
+        //    cône gloss resserré sur les sols : des reflets lisibles et
+        //    orientés vers les luminaires, pas un quadrillage de traînées
+        //    blanches qui ressemble à des « textures cassées ».
+        let cone = select(0.965, 0.96, n.y > 0.5);
         var spec = vec3<f32>(0.0, 0.0, 0.0);
         for (var i = 0u; i < 24u; i = i + 1u) {
             if (i >= nl_count) { break; }
@@ -519,7 +523,7 @@ fn fs(in: VSOut) -> FSOut {
             let glow = lc.rgb * lc.w * (1.0 - clamp(ds / 26.0, 0.0, 1.0) * 0.65);
             spec = spec + glow * smoothstep(cone, 1.0, align);
         }
-        refl = refl + spec * 1.8;
+        refl = refl + spec * 0.9;
     }
 
     o.out0 = vec4<f32>(ao, sh_static, sh_flash, 1.0);

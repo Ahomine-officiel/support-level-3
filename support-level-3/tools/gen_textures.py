@@ -168,13 +168,15 @@ save(a, "concrete_dark", blur=1.0)
 # ---------- sol couloir : lino usé ----------
 a = to_arr((80, 82, 80), S, 9, seed=120)
 a = pstains(a, 22, 24, seed=121)
-for _ in range(90):                                   # rayures claires/sombres
+# usure DISCRÈTE : l'ancien rendu (90 rayures très contrastées ±20) ressortait
+# comme du verre brisé à l'écran (« textures cassées ») — 28 marques douces ±9.
+for _ in range(28):
     x, y = rng.integers(0, S, 2)
-    col = (100, 102, 98) if rng.random() < 0.6 else (58, 60, 58)
-    pline(a, x, y, x + rng.integers(-70, 70), y + rng.integers(-70, 70), col, 1)
+    col = (88, 90, 87) if rng.random() < 0.6 else (70, 72, 71)
+    pline(a, x, y, x + rng.integers(-45, 45), y + rng.integers(-45, 45), col, 1)
 pgrid(a, S // 2, (60, 62, 60), 2)                     # lés de lino
 ao_edges(a, 6, 18)
-save(a, "floor_corridor", blur=0.4)
+save(a, "floor_corridor", blur=0.6)
 
 # ---------- sol bureau : dalles 2x2 ----------
 a = to_arr((70, 76, 84), S, 7, seed=130)
@@ -251,9 +253,9 @@ for _ in range(6):                                    # flaques d'huile
 # bande jaune de sécurité au centre
 a[:, S // 2 - 6:S // 2 - 2] = (168, 142, 34)
 a[:, S // 2 + 2:S // 2 + 6] = (168, 142, 34)
-for _ in range(40):
-    pline(a, rng.integers(0, S), rng.integers(0, S), rng.integers(0, S), rng.integers(0, S), (64, 62, 58), 1)
-save(a, "floor_elec", blur=0.5)
+for _ in range(16):
+    pline(a, rng.integers(0, S), rng.integers(0, S), rng.integers(0, S), rng.integers(0, S), (70, 68, 65), 1)
+save(a, "floor_elec", blur=0.6)
 
 # ---------- plafond : dalles acoustiques ----------
 a = to_arr((64, 64, 61), S, 5, seed=180)

@@ -15,7 +15,6 @@ use winit::window::Window;
 use wgpu::util::DeviceExt;
 
 pub const MAX_LIGHTS: usize = 24;
-
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct WorldUniform {
@@ -27,6 +26,8 @@ pub struct WorldUniform {
     pub flash_dir: [f32; 4],
     pub misc: [f32; 4],
     pub flash_col: [f32; 4],
+    /// Ambiance : x = calme (1 au début → 0 en horreur), y = peur, z,w libre.
+    pub mood: [f32; 4],
 }
 
 #[repr(C)]
@@ -87,7 +88,7 @@ pub fn material_def(name: &str) -> (String, f32) {
         "exit_sign" => 1.4,
         "eyes" => 2.6,
         "light_panel" => 1.25,
-        "battery" => 0.35,
+        "battery" => 1.4,
         "receipt_paper" => 0.05,
         "poster_a" | "poster_b" | "poster_c" | "poster_d" => 0.04,
         "entity_mask" => 0.03,
@@ -151,6 +152,16 @@ pub struct UpsParams {
 pub struct StaticBatches {
     pub batches: Vec<StaticBatch>,
     pub total_instances: usize,
+}
+
+/// Batches d'instances dynamiques reconstruits chaque frame (même mécanisme
+/// que les statiques : un buffer par part, créé hors encoder).
+pub struct DynBatches {
+    /// (clé de part, offset en octets dans le buffer d'origine, instances)
+    pub plan: Vec<(PartKey, u64, u32)>,
+    /// (clé de part, buffer d'instances, instances)
+    pub batches: Vec<(PartKey, wgpu::Buffer, u32)>,
+    pub max_end: u64,
 }
 
 pub struct Renderer {
@@ -225,8 +236,6 @@ pub struct Renderer {
     ui_index_buf: wgpu::Buffer,
     /// Capacité (en quads) de ui_index_buf — agrandie au besoin comme ui_buf.
     ui_index_cap: u32,
-
-    dyn_scratch: HashMap<PartKey, (wgpu::Buffer, u64)>,
 
     // ----- Capture d'écran (autopilot / [F12]) -----
     /// Si défini : la frame courante est rendue dans une texture dédiée puis
@@ -359,6 +368,7 @@ impl Renderer {
                 flash_dir: [0.0; 4],
                 misc: [0.0; 4],
                 flash_col: [0.0; 4],
+                mood: [1.0, 0.0, 0.0, 0.0],
             }),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -696,7 +706,6 @@ impl Renderer {
             ui_buf,
             ui_index_buf,
             ui_index_cap: 4096,
-            dyn_scratch: HashMap::new(),
             capture_path: None,
             capture_tex: None,
             rt_mode: 0,
@@ -826,10 +835,10 @@ impl Renderer {
     }
 
     /// Pré-pass profondeur (vertex seul) pour la passe de ray tracing.
-    fn prepass_pipeline(device: &wgpu::Device, bind0: &wgpu::BindGroupLayout, shader: &wgpu::ShaderModule) -> wgpu::RenderPipeline {
+    fn prepass_pipeline(device: &wgpu::Device, bind0: &wgpu::BindGroupLayout, bind1: &wgpu::BindGroupLayout, bind2: &wgpu::BindGroupLayout, shader: &wgpu::ShaderModule) -> wgpu::RenderPipeline {
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("prepass-pll"),
-            bind_group_layouts: &[bind0],
+            bind_group_layouts: &[bind0, bind1],
             push_constant_ranges: &[],
         });
         device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -1384,48 +1393,60 @@ impl Renderer {
     }
 
     // ---------- dessin ----------
-    /// Upload les instances dynamiques dans le scratch GPU et renvoie le plan
-    /// de dessin (clé de part + nombre d'instances).
-    fn upload_dynamics(&mut self, dynamics: &[(String, Vec<InstanceData>)]) -> Vec<(PartKey, u32)> {
-        let mut plan = Vec::new();
+    /// Construit les batches d'instances DYNAMIQUES avec le MÊME mécanisme que
+    /// les statiques (`build_static` : `create_buffer_init` hors encoder) — le
+    /// vertex-fetch d'instance des buffers réécrits dans le frame s'est révélé
+    /// non fiable sur certains drivers (lavapipe : colonnes de matrice corrompues).
+    /// Renvoie `None` s'il n'y a aucune instance (rien à dessiner).
+    pub fn build_dyn(&self, dynamics: &[(String, Vec<InstanceData>)]) -> Option<DynBatches> {
+        let mut groups: HashMap<PartKey, Vec<InstanceRaw>> = HashMap::new();
         for (model_name, insts) in dynamics {
+            if insts.is_empty() {
+                continue;
+            }
             let Some(model) = self.models.get(model_name) else { continue };
             for (pi, _part) in model.parts.iter().enumerate() {
-                if insts.is_empty() {
-                    continue;
+                let entry = groups
+                    .entry(PartKey { model: model_name.clone(), part: pi })
+                    .or_default();
+                for inst in insts {
+                    entry.push(inst.raw());
                 }
-                let key = PartKey { model: model_name.clone(), part: pi };
-                let raws: Vec<InstanceRaw> = insts.iter().map(|i| i.raw()).collect();
-                let bytes_needed = (raws.len() * std::mem::size_of::<InstanceRaw>()) as u64;
-                let needs_grow = self
-                    .dyn_scratch
-                    .get(&key)
-                    .map(|(_, cap)| *cap < bytes_needed)
-                    .unwrap_or(true);
-                if needs_grow {
-                    let cap = bytes_needed.max(1024);
-                    let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-                        label: Some("dyn-instances"),
-                        size: cap,
-                        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                        mapped_at_creation: false,
-                    });
-                    self.dyn_scratch.insert(key.clone(), (buf, cap));
-                }
-                let (buf, _cap) = &self.dyn_scratch[&key];
-                self.queue.write_buffer(buf, 0, bytemuck::cast_slice(&raws));
-                plan.push((key, raws.len() as u32));
             }
         }
-        plan
+        if groups.is_empty() {
+            return None;
+        }
+        let mut plan = Vec::new();
+        let mut offset = 0u64;
+        let stride = std::mem::size_of::<InstanceRaw>() as u64;
+        let mut max_end = 0u64;
+        let mut batches: Vec<(PartKey, wgpu::Buffer, u32)> = Vec::new();
+        let mut keys: Vec<PartKey> = groups.keys().cloned().collect();
+        keys.sort_by(|a, b| a.model.cmp(&b.model).then(a.part.cmp(&b.part)));
+        for key in keys {
+            let raws = groups.get(&key).unwrap();
+            let buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("dyn-instances"),
+                contents: bytemuck::cast_slice(raws),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+            let count = raws.len() as u32;
+            plan.push((key.clone(), offset, count));
+            batches.push((key, buf, count));
+            max_end = (offset + count as u64 * stride).max(max_end);
+            offset += count as u64 * stride;
+        }
+        Some(DynBatches { plan, batches, max_end })
     }
 
-    /// Dessine statiques + dynamiques (plan préparé) avec le pipeline donné.
+    /// Dessine statiques + batches dynamiques (préparés hors encoder) avec le
+    /// pipeline donné.
     fn draw_instances_pass(
         &self,
         pass: &mut wgpu::RenderPass<'static>,
         statics: &StaticBatches,
-        plan: &[(PartKey, u32)],
+        dyns: Option<&DynBatches>,
         pipeline: &wgpu::RenderPipeline,
     ) {
         pass.set_pipeline(pipeline);
@@ -1436,10 +1457,14 @@ impl Renderer {
             self.draw_part(pass, &batch.key, &batch.buffer, batch.count);
         }
 
-        // Dynamiques (déjà uploadées).
-        for (key, count) in plan {
-            let (buf, _cap) = &self.dyn_scratch[key];
-            self.draw_part(pass, key, buf, *count);
+        // Dynamiques : même chemin que les statiques (buffer dédié par part,
+        // créé hors encoder via create_buffer_init).
+        if let Some(d) = dyns {
+            for (key, buf, count) in &d.batches {
+                self.draw_part(pass, key, buf, *count);
+            }
+            let _ = &d.plan;
+            let _ = d.max_end;
         }
     }
 
@@ -1466,7 +1491,7 @@ impl Renderer {
         world_uniform: &WorldUniform,
         rt: Option<RtFrame>,
         statics: &StaticBatches,
-        dynamics: &[(String, Vec<InstanceData>)],
+        dyns: Option<&DynBatches>,
         ui_ops: &[ui::UiOp],
         post_params: [f32; 4],
         ups: Option<UpsFrame>,
@@ -1590,7 +1615,7 @@ impl Renderer {
         }
 
         // Upload des dynamiques (une seule fois, partagé par toutes les passes).
-        let dyn_plan = self.upload_dynamics(dynamics);
+
 
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("frame"),
@@ -1614,7 +1639,7 @@ impl Renderer {
                     occlusion_query_set: None,
                 });
                 let mut pass = pass.forget_lifetime();
-                self.draw_instances_pass(&mut pass, statics, &dyn_plan, &self.prepass_pipeline);
+                self.draw_instances_pass(&mut pass, statics, dyns, &self.prepass_pipeline);
             }
             {
                 let rt0_att = wgpu::RenderPassColorAttachment {
@@ -1727,7 +1752,7 @@ impl Renderer {
                     occlusion_query_set: None,
                 });
                 let mut pass = pass.forget_lifetime();
-                self.draw_instances_pass(&mut pass, statics, &dyn_plan, &self.world_pipeline_rt);
+                self.draw_instances_pass(&mut pass, statics, dyns, &self.world_pipeline_rt);
             }
         } else {
             let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1758,7 +1783,7 @@ impl Renderer {
             });
             // 'pass borrow self...' : étendre la durée de vie via transmute sûr ici
             let mut pass = pass.forget_lifetime();
-            self.draw_instances_pass(&mut pass, statics, &dyn_plan, &self.world_pipeline);
+            self.draw_instances_pass(&mut pass, statics, dyns, &self.world_pipeline);
         }
 
         // 2) Post-process -> cible pleine résolution (natif) ou basse résolution

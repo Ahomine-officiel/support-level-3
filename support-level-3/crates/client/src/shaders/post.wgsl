@@ -49,9 +49,10 @@ fn fs(in: VSOut) -> @location(0) vec4<f32> {
         textureSample(tex, samp, uv - vec2<f32>(ab, 0.0)).b,
     );
 
-    // Grain filmique.
+    // Grain filmique — quasi invisible au repos (début de partie lisible,
+    // pas du « bruit blanc ») et ne monte réellement qu'avec la peur.
     let g = fract(sin(dot(uv * (p.time + 3.0), vec2<f32>(12.9898, 78.233))) * 43758.5453);
-    col = col + (g - 0.5) * (0.045 + 0.05 * p.fear);
+    col = col + (g - 0.5) * (0.008 + 0.035 * p.fear);
 
     // Vignette.
     let vig = smoothstep(0.92, 0.3, length(c));

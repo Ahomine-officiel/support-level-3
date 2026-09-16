@@ -9,6 +9,8 @@ struct Uniforms {
     flash_dir: vec4<f32>,
     misc: vec4<f32>,
     flash_col: vec4<f32>,
+    /// x = calme (1 début → 0 horreur), y = peur.
+    mood: vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> u: Uniforms;
 // Résultat de la passe de ray tracing (optionnelle) :
@@ -61,9 +63,13 @@ fn vs(in: VertexInput, inst: InstanceInput) -> VSOut {
 @group(1) @binding(2) var<uniform> mat_u: vec4<f32>;
 
 const FOG_COLOR = vec3<f32>(0.012, 0.016, 0.026);
+const FOG_COLOR_CALME = vec3<f32>(0.05, 0.055, 0.068);
+const AMBIENT = vec3<f32>(0.035, 0.04, 0.055);
+const AMBIENT_CALME = vec3<f32>(0.16, 0.165, 0.18);
 
 @fragment
 fn fs(in: VSOut) -> @location(0) vec4<f32> {
+    if (in.emis.a > 2.0) { return vec4<f32>(1.0, 0.0, 1.0, 1.0); }
     let tex4 = textureSample(tex, samp, in.uv);
     let albedo = tex4.rgb * clamp(in.tint.rgb, vec3<f32>(0.0), vec3<f32>(2.0));
     let n = normalize(in.nrm);
@@ -80,7 +86,8 @@ fn fs(in: VSOut) -> @location(0) vec4<f32> {
 
     // Plancher de lisibilité : l'AO ne tue plus l'ambiance totale (RT dans le
     // noir = avant « on voit rien », l'ambiance est simplement atténuée).
-    var light = vec3<f32>(0.035, 0.04, 0.055) * mix(1.0, ao, 0.6);
+    // Au calme (début de partie) le site est un lieu de travail éclairé.
+    var light = mix(AMBIENT, AMBIENT_CALME, u.mood.x) * mix(1.0, ao, 0.6);
     let nl_count = u32(u.misc.x);
     for (var i: u32 = 0u; i < 24u; i = i + 1u) {
         if (i >= nl_count) { break; }
@@ -111,7 +118,7 @@ fn fs(in: VSOut) -> @location(0) vec4<f32> {
     let dist = length(in.wpos - u.cam_pos.xyz);
     let f = u.misc.z * dist;
     let fog = 1.0 - exp(-f * f);
-    color = mix(color, FOG_COLOR, fog);
+    color = mix(color, mix(FOG_COLOR, FOG_COLOR_CALME, u.mood.x), fog);
 
     return vec4<f32>(color, 1.0);
 }

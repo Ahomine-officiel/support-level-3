@@ -501,11 +501,22 @@ impl Game {
             }
             out.push(("receipt".into(), papers));
 
-            // Batteries.
+            // Batteries — VISIBLES : le modèle (20 cm) était quasi invisible
+            // dans le noir (aucun émissif, contrairement aux justificatifs).
+            // Glow cyan + lévitation + rotation + taille x1.5 : un pickup se
+            // repère de loin, pas une aiguille dans une botte de foin.
             let mut bats = Vec::new();
             for (i, b) in self.map.batteries.iter().enumerate() {
                 if !snap.batteries[i] {
-                    bats.push(InstanceData::new(trs(*b, i as f32)));
+                    let bob = 0.05 + 0.035 * (t * 2.1 + i as f32 * 1.31).sin();
+                    bats.push(
+                        InstanceData::new(
+                            Mat4::from_translation(*b + Vec3::new(0.0, bob, 0.0))
+                                * Mat4::from_rotation_y(t * 0.9 + i as f32 * 1.7)
+                                * Mat4::from_scale(Vec3::splat(1.5)),
+                        )
+                        .with_emissive([0.3, 0.75, 1.0, 2.6]),
+                    );
                 }
             }
             out.push(("battery".into(), bats));
@@ -620,6 +631,13 @@ impl Game {
         let dir = self.forward();
         let view_proj = self.view_proj_mat(aspect, jitter_ndc).to_cols_array_2d();
 
+        // Début de partie CALME : ce n'est pas un jeu d'horreur dès la première
+        // seconde — l'équipe arrive sur un site de travail éclairé. Le calme
+        // tient 90 s PUIS glisse vers l'horreur sur ~60 s (l'ancienne version
+        // décroissait dès t=0 : à 30 s de jeu tout l'apport était déjà parti).
+        let calm_raw = ((self.time - 90.0) / 60.0).clamp(0.0, 1.0);
+        let calm = 1.0 - calm_raw * calm_raw * (3.0 - 2.0 * calm_raw);
+
         let mut u = WorldUniform {
             view_proj,
             cam_pos: [eye.x, eye.y, eye.z, 0.0],
@@ -627,8 +645,9 @@ impl Game {
             light_col: [[0.0; 4]; MAX_LIGHTS],
             flash_pos: [eye.x, eye.y, eye.z, 0.0],
             flash_dir: [dir.x, dir.y, dir.z, 0.955],
-            misc: [0.0, self.time, 0.055, 0.90],
+            misc: [0.0, self.time, 0.055 - 0.027 * calm, 0.90],
             flash_col: [1.0, 0.92, 0.78, 0.0],
+            mood: [calm, self.fear, 0.0, 0.0],
         };
 
         if self.light_on {
@@ -650,8 +669,10 @@ impl Game {
                 } else {
                     1.0
                 };
-                u.light_pos[n] = [l.pos.x, l.pos.y, l.pos.z, 9.0];
-                u.light_col[n] = [l.color[0], l.color[1], l.color[2], 1.5 * on];
+                // Au calme : néons plus intenses ET plus portée — le site est
+                // un lieu de travail en état de marche, on voit toute la salle.
+                u.light_pos[n] = [l.pos.x, l.pos.y, l.pos.z, 9.0 + 6.0 * u.mood[0]];
+                u.light_col[n] = [l.color[0], l.color[1], l.color[2], (1.5 + 1.0 * u.mood[0]) * on];
                 n += 1;
             }
         }
