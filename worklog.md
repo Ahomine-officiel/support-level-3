@@ -268,3 +268,12 @@ Stage Summary:
 - RT Qualité = 0.7× surface native (896×504 @720p, vs 512×288 avant), Ultra 0.8, Overdrive 0.9 ; plus de cascade DRS×FSR×RT (0.09× dans le pire cas) ; GI débruité 5-taps.
 - Captures : download/captures/fix_rt_floor.png (Qualité), fix_rt_ultra.png (Ultra).
 - Push : cf. section commit ci-dessous.
+
+Stage Summary (complément Task 9) :
+- Commit local 08223c3 prêt sur main (code + captures + zip + binaires + worklog).
+- PUSH BLOQUÉ : « could not read Username for 'https://github.com' » — le token fourni
+  par l'utilisateur en session précédente n'est plus dans l'environnement (retiré de
+  .git/config après le dernier push, jamais stocké ailleurs). En attente d'un token
+  frais (fine-grained, scope repo support-level-3, permission Contents: write) pour
+  exécuter : git push https://<TOKEN>@github.com/Ahomine-officiel/support-level-3.git main
+  puis re-nettoyer .git/config. L'ancien token doit rester révoqué.
