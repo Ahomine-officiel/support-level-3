@@ -246,7 +246,8 @@ pub struct Renderer {
     // ----- Ray tracing optionnel -----
     /// 0 = désactivé, 1 = qualité (ombres + AO), 2 = ultra (+ GI 2 rebonds), 3 = overdrive (path tracing).
     pub rt_mode: u8,
-    /// Échelle du tampon RT relativement au tampon monde.
+    /// Échelle du tampon RT relativement à la SURFACE native (pas au tampon
+    /// monde : DRS et FSR 3 se multipliaient en cascade avec cette échelle).
     rt_scale: f32,
     world_bind_layout: wgpu::BindGroupLayout,
     world_pipeline_rt: wgpu::RenderPipeline,
@@ -709,7 +710,7 @@ impl Renderer {
             capture_path: None,
             capture_tex: None,
             rt_mode: 0,
-            rt_scale: 0.4,
+            rt_scale: 0.7,
             world_bind_layout,
             world_pipeline_rt,
             prepass_pipeline,
@@ -1268,12 +1269,15 @@ impl Renderer {
 
     // ---------- ray tracing (optionnel) ----------
 
-    /// Échelle du tampon RT selon le mode : qualité 0.4x, ultra 0.5x, overdrive 0.6x.
+    /// Échelle du tampon RT relativement à la SURFACE native. (Avant : 0.4/
+    /// 0.5/0.6 du tampon monde, lui-même réduit par le DRS (×0.45) et l'FSR 3
+    /// (×0.5) -> pire cas 0.09× l'écran = « RT ultra pixelisé ».)
+    /// Qualité 0.7x · Ultra 0.8x · Overdrive 0.9x.
     fn rt_target_scale(mode: u8) -> f32 {
         match mode {
-            2 => 0.5,
-            3 => 0.6,
-            _ => 0.4,
+            2 => 0.8,
+            3 => 0.9,
+            _ => 0.7,
         }
     }
 
@@ -1304,14 +1308,28 @@ impl Renderer {
         self.rebuild_world_bind();
     }
 
-    /// Recrée les cibles RT (dépendent du mode + de la taille du tampon monde).
+    /// Recrée les cibles RT (dépendent du mode + de la taille de la surface).
     fn recreate_rt_targets(&mut self) {
         if self.rt_mode == 0 {
             return;
         }
-        let (ow, oh) = self.scaled_size();
-        let w = ((ow as f32 * self.rt_scale) as u32).max(1);
-        let h = ((oh as f32 * self.rt_scale) as u32).max(1);
+        // Base = surface NATIVE : l'échelle interne (DRS) et l'upscaling FSR 3
+        // réduisent déjà le tampon monde ; les multiplier par l'échelle RT
+        // donnait un tampon RT minuscule (pire cas 0.09× l'écran = pixels
+        // géants). Plafond DRS : si le GPU faiblit et que le DRS descend le
+        // rendu monde, le RT suit (jamais sous 0.5× la surface) ; en rendu
+        // natif l'échelle du mode s'applique telle quelle (0.7/0.8/0.9).
+        let (uw, uh) = (self.surface_config.width.max(1), self.surface_config.height.max(1));
+        let mut k = self.rt_scale;
+        // Override QA (lavapipe logiciel) : SL3_RT_SCALE=0.4 par exemple.
+        if let Ok(v) = std::env::var("SL3_RT_SCALE") {
+            if let Ok(f) = v.parse::<f32>() {
+                k = f.clamp(0.1, 1.0);
+            }
+        }
+        let k = k.min((self.render_scale * self.ups_scale).max(0.5));
+        let w = ((uw as f32 * k) as u32).clamp(1, uw);
+        let h = ((uh as f32 * k) as u32).clamp(1, uh);
         let (t0, v0) = Self::make_rt_target(&self.device, w, h, "rt0");
         let (t1, v1) = Self::make_rt_target(&self.device, w, h, "rt1");
         self.rt0_tex = t0;

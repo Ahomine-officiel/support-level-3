@@ -249,3 +249,22 @@ Stage Summary:
 - Toutes les remontées joueur corrigées et vérifiées par captures : souris non inversée (raw input), monde intègre (la cause racine était les MODÈLES géants, pas les PNG), batterie visible/émissive/lévitante, début calme non-horreur.
 - Debug QA ajoutés (gated SL3_DEBUG) : [sl3-debug] battery TRS (positions GPU réelles), dyn draw (batchs/mats/bind groups), print des batteries au démarrage, voisinnage solid après tp.
 - GitHub à jour : https://github.com/Ahomine-officiel/support-level-3 (main, 1bb6dac). Zip : download/support-level-3.zip.
+
+---
+Task ID: 9
+Agent: Super Z (main)
+Task: « le rt est ultra pixeliser et commit tout sur github » — corriger la pixelisation du rendu ray tracing, valider, puis tout committer et pousser sur GitHub.
+
+Work Log:
+- DIAGNOSTIC : le tampon RT était dimensionné à 0.4/0.5/0.6× du TAMON MONDE, lui-même réduit par le DRS (×0.45 min) et l'upscaling FSR 3 (×0.5 en preset Perf) -> pire cas 0.09× la résolution native = pixels géants. En plus, le GI Monte-Carlo (1 échantillon/px) était échantillonné 1-tap dans world.wgsl -> bruit « neige » qui aggravait l'effet.
+- FIX gpu/mod.rs recreate_rt_targets : base = SURFACE NATIVE (le DRS/FSR ne se multiplient plus en cascade), échelles relevées Qualité 0.7 / Ultra 0.8 / Overdrive 0.9, plafond DRS min(échelle_mode, max(échelle_monde, 0.5)) — un GPU faible fait descendre le RT avec lui mais jamais sous 0.5× la surface. Bug de formule attrapé au test : un premier jet avec max() forçait le RT à 100 % en natif (log [rt] tampon 1280x720), corrigé en min() -> 896x504 attendu et obtenu.
+- Override QA : SL3_RT_SCALE=0..1 (lavapipe logiciel).
+- FIX world.wgsl : débruitage 5-taps en croix (centre + 4 voisins à 0.75 texel RT) sur rt0 ET rt1 -> le bruit MC disparaît sans flouter (croix fine à 0.7×+). Hors RT : textures neutres 1x1 -> 5 taps identiques, rendu inchangé (vérifié capture début calme).
+- Docs rt.wgsl + commentaires mod.rs mis à jour (0.7x/0.8x/0.9x surface, plafond DRS 0.5x).
+- VALIDATION (lavapipe + Xvfb + autopilot, captures relues) : fix_rt_floor.png (RT Qualité, tampon 896x504 loggé, couloir net, reflets sols doux, 0 pixelisation) ; fix_rt_ultra.png (RT Ultra taggé « 14 r/px », GI lisse) ; suite calme RT-off (fix_calm_start/fix_battery/fix_look_right) intacte -> aucune régression du world.wgsl. Build release 0 warning, tests client verts (naga valide les WGSL modifiés).
+- Zip repackagé (binaires release à jour), commit + push.
+
+Stage Summary:
+- RT Qualité = 0.7× surface native (896×504 @720p, vs 512×288 avant), Ultra 0.8, Overdrive 0.9 ; plus de cascade DRS×FSR×RT (0.09× dans le pire cas) ; GI débruité 5-taps.
+- Captures : download/captures/fix_rt_floor.png (Qualité), fix_rt_ultra.png (Ultra).
+- Push : cf. section commit ci-dessous.

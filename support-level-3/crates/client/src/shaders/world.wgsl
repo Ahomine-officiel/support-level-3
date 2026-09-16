@@ -76,8 +76,27 @@ fn fs(in: VSOut) -> @location(0) vec4<f32> {
     // Résultat RT échantillonné à l'écran (projection de la position monde).
     let sp = u.view_proj * vec4<f32>(in.wpos, 1.0);
     let suv = sp.xy / max(sp.w, 1e-4) * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5, 0.5);
-    let rt0 = textureSampleLevel(rt0_tex, rt_samp, suv, 0.0);
-    let rt1 = textureSampleLevel(rt1_tex, rt_samp, suv, 0.0);
+    // Débruitage 5-taps en croix : le GI est du Monte-Carlo (1-2 échantillons
+    // par pixel RT), sans ce filtre le bruit ressemblait à de la neige
+    // pixelisée. Le tampon RT est ≥ 0.7× la surface, la croix reste donc
+    // fine (détail préservé, pas de flou) ; hors RT les textures neutres
+    // 1x1 renvoient la même valeur aux 5 taps -> rendu inchangé.
+    let rt_td = vec2<f32>(textureDimensions(rt0_tex));
+    let rt_tx = 0.75 / max(rt_td, vec2<f32>(1.0));
+    let rt0 = (
+        textureSampleLevel(rt0_tex, rt_samp, suv, 0.0)
+        + textureSampleLevel(rt0_tex, rt_samp, suv + vec2<f32>(rt_tx.x, 0.0), 0.0)
+        + textureSampleLevel(rt0_tex, rt_samp, suv - vec2<f32>(rt_tx.x, 0.0), 0.0)
+        + textureSampleLevel(rt0_tex, rt_samp, suv + vec2<f32>(0.0, rt_tx.y), 0.0)
+        + textureSampleLevel(rt0_tex, rt_samp, suv - vec2<f32>(0.0, rt_tx.y), 0.0)
+    ) * 0.2;
+    let rt1 = (
+        textureSampleLevel(rt1_tex, rt_samp, suv, 0.0)
+        + textureSampleLevel(rt1_tex, rt_samp, suv + vec2<f32>(rt_tx.x, 0.0), 0.0)
+        + textureSampleLevel(rt1_tex, rt_samp, suv - vec2<f32>(rt_tx.x, 0.0), 0.0)
+        + textureSampleLevel(rt1_tex, rt_samp, suv + vec2<f32>(0.0, rt_tx.y), 0.0)
+        + textureSampleLevel(rt1_tex, rt_samp, suv - vec2<f32>(0.0, rt_tx.y), 0.0)
+    ) * 0.2;
     let ao = rt0.r;
     let sh = rt0.g;
     let shf = rt0.b;

@@ -15,7 +15,8 @@
 //     portes, les néons et la traînée de la torche
 // Sortie MRT : out0 = (ao, ombre_statique, ombre_torche, 1)
 //              out1 = (gi path traced + réflexions, 1)
-// Résolution indépendante (0.4x / 0.5x / 0.6x du tampon monde) — pensé RTX 2060.
+// Résolution indépendante (0.7x / 0.8x / 0.9x de la surface native, plancher
+// 0.5x via DRS, override SL3_RT_SCALE) — pensé RTX 2060.
 
 struct WorldU {
     view_proj: mat4x4<f32>,
