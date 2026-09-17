@@ -303,3 +303,18 @@ Stage Summary:
 - Guidage objectif permanent actif (crochet/flèche + distance + priorité dynamique) ; textures 1024 px avec chromatique + relief.
 - Captures : fix_marker_east.png, fix_marker_west.png, fix_calm_start.png (v3).
 - Push toujours BLOQUÉ (403) : commits 08223c3, 8790c04 + celui-ci en local sur main.
+
+---
+Task ID: 10-bis
+Agent: Super Z (main)
+Task: Push des commits en attente avec le nouveau token fourni par l'utilisateur.
+
+Work Log:
+- Token reçu (ghp_yssz...). Push direct par URL : git push https://<TOKEN>@github.com/Ahomine-officiel/support-level-3.git main -> OK 47770e2..3d38d98.
+- Nettoyage immédiat : git remote set-url origin (URL sans token), vérification config (aucune trace), rm ~/.git-credentials ~/.netrc.
+- Vérification distante : git ls-remote -> refs/heads/main = 3d38d98 ; fetch + log origin/main confirme les 3 commits (08223c3 fix RT, 8790c04 worklog, 3d38d98 guidage+textures v3).
+
+Stage Summary:
+- GitHub à jour : https://github.com/Ahomine-officiel/support-level-3 (main, 3d38d98). Les 3 tâches utilisateur (fix RT pixelisé, guidage objectif, textures v3) sont livrées.
+- Token stocké NULLE PART (utilisé en ligne de commande uniquement, retiré ensuite). L'utilisateur doit révoquer ce token dans GitHub Settings -> Developer settings car il est apparu en clair dans le chat.
+
