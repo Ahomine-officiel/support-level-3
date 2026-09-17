@@ -1,10 +1,22 @@
-//! HUD en jeu : crosshair, objectifs, tickets, interactions, messages.
+//! HUD en jeu : crosshair, objectifs, tickets, interactions, messages,
+//! marqueur de guidage vers l'objectif courant.
 
 use crate::gpu::ui::{text_width, FontData, UiOp};
 use crate::game::Game;
 use crate::lang::{t, Lang};
 use sl3_shared::consts::*;
 use sl3_shared::protocol::{Interactable, Snapshot};
+
+/// Marqueur d'objectif du guidage : position projetée à l'écran (calculée
+/// côté app avec la view_proj), distance en mètres et type d'objectif
+/// (0 serveur · 1 justificatif · 2 terminal · 3 sortie · 4 batterie).
+pub struct Marker {
+    pub sx: f32,
+    pub sy: f32,
+    pub on_screen: bool,
+    pub dist: f32,
+    pub kind: u8,
+}
 
 #[allow(dead_code)]
 const WHITE: [f32; 4] = [0.9, 0.92, 0.95, 1.0];
@@ -13,14 +25,14 @@ const GREEN: [f32; 4] = [0.5, 0.95, 0.55, 1.0];
 const RED: [f32; 4] = [1.0, 0.4, 0.35, 1.0];
 const AMBER: [f32; 4] = [1.0, 0.78, 0.3, 1.0];
 
-pub fn draw(ui: &mut Vec<UiOp>, g: &Game, font: &FontData, lang: Lang, size: (f32, f32)) {
+pub fn draw(ui: &mut Vec<UiOp>, g: &Game, font: &FontData, lang: Lang, size: (f32, f32), marker: Option<Marker>) {
     let snap = match &g.snap {
         Some(s) => s,
         None => return,
     };
     let my_state = g.my_state();
     let (w, h) = size;
-    draw_hud(ui, g, snap, my_state, font, lang, (w, h));
+    draw_hud(ui, g, snap, my_state, font, lang, (w, h), marker);
 }
 
 fn draw_hud(
@@ -31,6 +43,7 @@ fn draw_hud(
     font: &FontData,
     lang: Lang,
     size: (f32, f32),
+    marker: Option<Marker>,
 ) {
     let (w, h) = size;
     let font_size = 17.0;
@@ -128,6 +141,70 @@ fn draw_hud(
         let tw2 = text_width(font, &ticket, 15.0);
         if tw2 < w - 40.0 {
             ui.push(UiOp::text(w / 2.0 - tw2 / 2.0, 12.0, 15.0, [0.7, 0.72, 0.75, 0.55], &ticket));
+        }
+    }
+
+    // ---- Marqueur de guidage vers l'objectif courant ----
+    // Sur l'écran : crochet [ ] autour du point + distance. Hors champ :
+    // flèche pixel + étiquette collée au bord le plus proche.
+    if my_state == PLAYER_ALIVE {
+        if let Some(m) = marker {
+            let (label_key, col) = match m.kind {
+                0 => (crate::lang::GUIDE_SERVER, AMBER),
+                1 => (crate::lang::GUIDE_RECEIPT, AMBER),
+                2 => (crate::lang::GUIDE_TERMINAL, GREEN),
+                3 => (crate::lang::GUIDE_EXIT, GREEN),
+                _ => (crate::lang::GUIDE_BATTERY, [0.55, 0.85, 1.0, 1.0]),
+            };
+            let label = t(lang, label_key);
+            let dm = format!("{} m", m.dist as u32);
+            if m.on_screen {
+                let s = 13.0; // demi-taille du crochet
+                let (x0, y0, x1, y1) = (m.sx - s, m.sy - s, m.sx + s, m.sy + s);
+                for (rx, ry, rw, rh) in [
+                    (x0, y0, 10.0, 2.0),
+                    (x1 - 10.0, y0, 10.0, 2.0),
+                    (x0, y1 - 2.0, 10.0, 2.0),
+                    (x1 - 10.0, y1 - 2.0, 10.0, 2.0),
+                    (x0, y0, 2.0, 10.0),
+                    (x0, y1 - 10.0, 2.0, 10.0),
+                    (x1 - 2.0, y0, 2.0, 10.0),
+                    (x1 - 2.0, y1 - 10.0, 2.0, 10.0),
+                ] {
+                    ui.push(UiOp::Rect { x: rx, y: ry, w: rw, h: rh, color: col });
+                }
+                let dtw = text_width(font, &dm, 13.0);
+                ui.push(UiOp::text(m.sx - dtw / 2.0, y1 + 5.0, 13.0, col, &dm));
+            } else {
+                // Flèche pixel-art pointant la direction dominante.
+                let dx = m.sx - w / 2.0;
+                let dy = m.sy - h / 2.0;
+                if dx.abs() >= dy.abs() {
+                    if dx >= 0.0 {
+                        ui.push(UiOp::Rect { x: m.sx + 8.0, y: m.sy - 7.0, w: 2.0, h: 14.0, color: col });
+                        ui.push(UiOp::Rect { x: m.sx + 4.0, y: m.sy - 4.0, w: 4.0, h: 8.0, color: col });
+                        ui.push(UiOp::Rect { x: m.sx, y: m.sy - 1.5, w: 4.0, h: 3.0, color: col });
+                    } else {
+                        ui.push(UiOp::Rect { x: m.sx - 10.0, y: m.sy - 7.0, w: 2.0, h: 14.0, color: col });
+                        ui.push(UiOp::Rect { x: m.sx - 6.0, y: m.sy - 4.0, w: 4.0, h: 8.0, color: col });
+                        ui.push(UiOp::Rect { x: m.sx - 4.0, y: m.sy - 1.5, w: 4.0, h: 3.0, color: col });
+                    }
+                } else if dy >= 0.0 {
+                    ui.push(UiOp::Rect { x: m.sx - 7.0, y: m.sy + 8.0, w: 14.0, h: 2.0, color: col });
+                    ui.push(UiOp::Rect { x: m.sx - 4.0, y: m.sy + 4.0, w: 8.0, h: 4.0, color: col });
+                    ui.push(UiOp::Rect { x: m.sx - 1.5, y: m.sy, w: 3.0, h: 4.0, color: col });
+                } else {
+                    ui.push(UiOp::Rect { x: m.sx - 7.0, y: m.sy - 10.0, w: 14.0, h: 2.0, color: col });
+                    ui.push(UiOp::Rect { x: m.sx - 4.0, y: m.sy - 6.0, w: 8.0, h: 4.0, color: col });
+                    ui.push(UiOp::Rect { x: m.sx - 1.5, y: m.sy - 4.0, w: 3.0, h: 4.0, color: col });
+                }
+                let line = format!("{label} - {dm}");
+                let ltw = text_width(font, &line, 13.0);
+                let lx = (m.sx - ltw / 2.0).clamp(8.0, w - ltw - 8.0);
+                let ly = (m.sy + 14.0).min(h - 22.0);
+                ui.push(UiOp::Rect { x: lx - 6.0, y: ly - 5.0, w: ltw + 12.0, h: 18.0, color: [0.02, 0.03, 0.05, 0.6] });
+                ui.push(UiOp::text(lx, ly, 13.0, col, &line));
+            }
         }
     }
 

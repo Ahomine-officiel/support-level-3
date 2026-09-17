@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
 """Génère toutes les textures PNG du jeu (style sombre + usé, SANS COUTURES).
 
+Améliorations v3 (« les textures sont pas incroyable ») :
+- 1024 px pour les grandes surfaces (murs, sols, plafond) — détail au corps à corps ;
+- variation chromatique lente par canal (grandes plages) : casse l'uniformité
+  « aplat de peinture » sans casser la tuilabilité (fbm périodique) ;
+- micro-relief embossé (dérivée d'un fbm fin, lumière nord-ouest) : la matière
+  réagit à la lumière au lieu d'être un décalque plat ;
+- taches / AO / épaisseurs de joints mis à l'échelle avec la résolution.
+
 Améliorations v2 :
 - bruit de valeur périodique multi-octaves (fbm) -> textures tuilables sans raccord ;
-- 512 px pour les grandes surfaces (murs, sols, plafond), 256 px pour le mobilier ;
 - taches / fissures / rayures périodiques (distance torique) ;
 - faux AO aux joints de dalles et au pied des murs ;
 - même liste de noms de fichiers que v1 (aucun changement côté moteur).
@@ -54,15 +61,33 @@ def fbm(S, seed, cells0=4, octaves=5, gain=0.55):
 def to_arr(rgb, S, noise=12, seed=0):
     a = np.zeros((S, S, 3), np.float32)
     a[:, :] = rgb
+    # Variation chromatique lente, par canal (fbm périodique 3 cellules, une
+    # phase différente par canal) : grandes plages légèrement dérivées, la
+    # couleur n'est plus un aplat unique sur tout le mur / le sol.
+    for c, cs in enumerate((11, 13, 17)):
+        v = fbm(S, seed + 31 + cs, 3, 3) - 0.5
+        a[:, :, c] += v * 20.0
     if noise:
         n = (fbm(S, seed, 8, 5) - 0.5) * 2 * noise
         g = np.random.default_rng(seed + 1).normal(0, noise * 0.35, (S, S, 1)).astype(np.float32)
         a += n[..., None] + g
+        # Micro-relief embossé : dérivée d'un fbm fin (32 cellules), lumière
+        # venant du nord-ouest. Normalisé par l'écart-type -> intensité stable
+        # quelle que soit la résolution. Tuilable (roll = retour périodique).
+        h = fbm(S, seed + 77, 32, 4)
+        h -= h.mean()
+        std = h.std() + 1e-6
+        gx = (np.roll(h, -1, 1) - np.roll(h, 1, 1)) / (2 * std)
+        gy = (np.roll(h, -1, 0) - np.roll(h, 1, 0)) / (2 * std)
+        a -= ((gx + gy) * 7.0)[..., None]
     return a
 
 def pstains(a, n, dark, blur=3.0, seed=7, rmin=20, rmax=90):
-    """Taches sombres périodiques (distance torique -> pas de raccord)."""
+    """Taches sombres périodiques (distance torique -> pas de raccord).
+    Rayons mis à l'échelle avec la résolution (référence 512 px)."""
     S = a.shape[0]
+    k_s = S / 512.0
+    rmin, rmax = max(2, int(rmin * k_s)), max(3, int(rmax * k_s))
     yy, xx = np.mgrid[0:S, 0:S].astype(np.float32)
     mask = np.zeros((S, S), np.float32)
     r = np.random.default_rng(seed)
@@ -109,8 +134,10 @@ def pgrid(a, step, color, w=1):
             a[:, (p + k) % S, :] = color
 
 def ao_edges(a, width=6, strength=34):
-    """Assombrit les bords de la tuile (faux AO aux joints)."""
+    """Assombrit les bords de la tuile (faux AO aux joints).
+    Largeur mise à l'échelle avec la résolution (référence 512 px)."""
     S = a.shape[0]
+    width = max(2, int(width * S / 512.0))
     ramp = np.linspace(1.0, 0.0, width, dtype=np.float32)
     m = np.ones((S, S), np.float32)
     for i, v in enumerate(ramp):
@@ -132,12 +159,14 @@ def save(a, name, blur=0.0):
 def S_of(name):
     big = {"concrete", "concrete_dark", "floor_corridor", "floor_office", "floor_server",
            "floor_arch", "floor_hall", "floor_elec", "ceiling"}
-    return 512 if name in big else 256
+    # v3 : 1024 px pour les grandes surfaces (détail visible de près), 256 px
+    # pour le mobilier (vu à distance moyenne, coût mémoire maîtrisé).
+    return 1024 if name in big else 256
 
-# ================= GRANDES SURFACES (512, tuilables) =================
+# ================= GRANDES SURFACES (1024 en v3, tuilables) =================
 
 # ---------- mur béton ----------
-S = 512
+S = 1024
 a = to_arr((92, 95, 92), S, 10, seed=100)
 a = pstains(a, 26, 26, seed=101)
 a = pstains(a, 8, 18, seed=102, rmax=200)            # grandes auréoles
@@ -153,11 +182,13 @@ for i in range(4):
         nx, ny = x + rng.integers(-30, 30), y + rng.integers(8, 40)
         pline(a, x, y, nx, ny, (76, 79, 76), 1, seed=int(rng.integers(1 << 30)))
         x, y = nx % S, ny % S
-# joints de coffrage horizontaux + trous de banche
+# joints de coffrage horizontaux + trous de banche (grille régulière 2x2 de
+# perces + halo clair dessous : relief de plaque banchée lisible de près)
 pgrid(a, S // 2, (70, 73, 70), 3)
-for (px, py) in ((S // 8, S // 4), (S * 5 // 8, S * 3 // 4)):
-    a[py - 5:py + 5, px - 5:px + 5] = (48, 48, 46)
-    a[py - 3:py + 3, px - 3:px + 3] = (36, 36, 35)
+for (px, py) in ((S // 4, S // 4), (S * 3 // 4, S // 4), (S // 4, S * 3 // 4), (S * 3 // 4, S * 3 // 4)):
+    a[py - 8:py + 8, px - 8:px + 8] = (48, 48, 46)
+    a[py - 5:py + 5, px - 5:px + 5] = (36, 36, 35)
+    a[py + 8:py + 11, px - 6:px + 6] = (108, 111, 108)   # lèvre éclairée en dessous
 ao_edges(a, 8, 20)
 save(a, "concrete", blur=0.8)
 
@@ -170,13 +201,20 @@ save(a, "concrete_dark", blur=1.0)
 # ---------- sol couloir : lino usé ----------
 a = to_arr((80, 82, 80), S, 9, seed=120)
 a = pstains(a, 22, 24, seed=121)
+# Dalles de lino 4x4 : variation de teinte par dalle + liseré sombre —
+# rythme visuel lisible sous les pieds (le 2x2 d'origine était trop grand).
+tile = S // 4
+for ty in range(4):
+    for tx in range(4):
+        sl = a[ty * tile:(ty + 1) * tile, tx * tile:(tx + 1) * tile]
+        sl += rng.uniform(-9, 9)
+pgrid(a, tile, (58, 60, 58), 2)                       # joints de dalles
 # usure DISCRÈTE : l'ancien rendu (90 rayures très contrastées ±20) ressortait
 # comme du verre brisé à l'écran (« textures cassées ») — 28 marques douces ±9.
 for _ in range(28):
     x, y = rng.integers(0, S, 2)
     col = (88, 90, 87) if rng.random() < 0.6 else (70, 72, 71)
     pline(a, x, y, x + rng.integers(-45, 45), y + rng.integers(-45, 45), col, 1)
-pgrid(a, S // 2, (60, 62, 60), 2)                     # lés de lino
 ao_edges(a, 6, 18)
 save(a, "floor_corridor", blur=0.6)
 

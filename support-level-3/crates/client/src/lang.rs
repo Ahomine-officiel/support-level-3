@@ -121,6 +121,11 @@ pub const RT_OVERDRIVE: usize = 94;
 pub const RT_TAG_Q: usize = 95;
 pub const RT_TAG_U: usize = 96;
 pub const RT_TAG_OD: usize = 97;
+pub const GUIDE_SERVER: usize = 98;
+pub const GUIDE_RECEIPT: usize = 99;
+pub const GUIDE_TERMINAL: usize = 100;
+pub const GUIDE_EXIT: usize = 101;
+pub const GUIDE_BATTERY: usize = 102;
 
 pub fn t(lang: Lang, key: usize) -> &'static str {
     let (fr, en) = TEXTS[key];
@@ -347,4 +352,14 @@ pub const TEXTS: &[(&str, &str)] = &[
     ("RT Ultra", "RT Ultra"),
     // 97
     ("RT Overdrive", "RT Overdrive"),
+    // 98
+    ("Baie serveur", "Server bay"),
+    // 99
+    ("Justificatif", "Receipt"),
+    // 100
+    ("Terminal RH", "HR terminal"),
+    // 101
+    ("SORTIE", "EXIT"),
+    // 102
+    ("Batterie", "Battery"),
 ];

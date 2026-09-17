@@ -277,3 +277,29 @@ Stage Summary (complément Task 9) :
   frais (fine-grained, scope repo support-level-3, permission Contents: write) pour
   exécuter : git push https://<TOKEN>@github.com/Ahomine-officiel/support-level-3.git main
   puis re-nettoyer .git/config. L'ancien token doit rester révoqué.
+
+---
+Task ID: 10
+Agent: Super Z (main)
+Task: « c dur de comprendre ou on doit aller et les textures sont pas incroyable » — guidage objectif + textures v3. Push RT en attente (403 token Ahom165 != propriétaire Ahomine-officiel).
+
+Work Log:
+- PUSH : token fourni (compte Ahom165) REFUSÉ 403 sur Ahomine-officiel/support-level-3 — il manque le droit d'écriture (collaborateur ou token du compte propriétaire, Contents: Read/Write). Commits 08223c3 + 8790c04 toujours en local.
+- RESET CONTENEUR en cours de tâche : ~/.cargo + ~/.local-* effacés, projet intact. scripts/rebuild_env.sh réexécuté (rustup 1.98.1, ALSA, x11, lavapipe ICD patché), build release 0 warning.
+- GUIDAGE (« où aller ») :
+  - game.rs : current_objective() — priorité batterie (si batterie<35 %, batteries prises exclues) -> baie serveur hors ligne la plus proche -> justificatif restant -> terminal RH -> sortie ouverte. Renvoie (pos monde +hauteur, type 0-4).
+  - game.rs : view_proj() publique (projection écran du marqueur).
+  - app.rs : projection de l'objectif (NDC -> écran, miroir si derrière la caméra, clamp aux bords 70/84 px), passe hud::draw(..., marker).
+  - hud.rs : struct Marker + dessin — SUR ÉCRAN : crochet [ ] coloré (ambre serveur/justificatif, vert terminal/sortie, cyan batterie) + distance « N m » ; HORS CHAMP : flèche pixel-art (3 rects, direction dominante) + étiquette « Baie serveur - N m » collée au bord.
+  - lang.rs : clés 98-102 (Baie serveur / Justificatif / Terminal RH / SORTIE / Batterie, FR+EN). Aucun glyphe nouveau -> atlas fonte inchangé.
+- TEXTURES v3 (tools/gen_textures.py, « pas incroyable ») :
+  - grandes surfaces 512 -> 1024 px (concrete, concrete_dark, 6 sols, ceiling) ; mobilier 256 inchangé ;
+  - to_arr : variation chromatique lente par canal (fbm 3 cellules, ±10/canal) + micro-relief embossé (dérivée fbm 32 cellules normalisée, lumière NW, ±7) -> la matière accroche la lumière, plus d'aplat plat ;
+  - pstains/ao_edges mis à l'échelle S/512 (rayons/largeurs) ;
+  - béton : 4 trous de banche en grille 2x2 avec lèvre éclairée dessous ; lino couloir : dalles 4x4 à variation de teinte + joints (rythme sous les pieds) ;
+  - bundle include_bytes! : simple rebuild (pas de regen de liste) ; 12 Mo au total.
+- VALIDATION (lavapipe + Xvfb + autopilot, captures relues) : fix_marker_east.png — crochet ambre + « 2 m » centré sur la baie serveur + prompt [E] reboot ; fix_calm_start.png — flèche + « Baie serveur - 75 m » au bord gauche (objectif hors champ) + murs v3 (coffrage, variations, trous de banche) ; RT re-validé 896x504 (log passe 25) ; tests client verts (naga WGSL OK).
+Stage Summary:
+- Guidage objectif permanent actif (crochet/flèche + distance + priorité dynamique) ; textures 1024 px avec chromatique + relief.
+- Captures : fix_marker_east.png, fix_marker_west.png, fix_calm_start.png (v3).
+- Push toujours BLOQUÉ (403) : commits 08223c3, 8790c04 + celui-ci en local sur main.

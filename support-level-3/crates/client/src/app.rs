@@ -1119,8 +1119,33 @@ impl App {
                     a.set_loop_volume("whisper", fear * 0.6);
                     a.set_loop_volume("ambience", 0.10 + 0.45 * fear);
                 }
+                // Marqueur de guidage : projection de l'objectif courant
+                // (batterie/serveur/justificatif/terminal/sortie) à l'écran.
+                let marker = self.game.as_ref().and_then(|g| {
+                    let (wpos, kind) = g.current_objective()?;
+                    let vp = g.view_proj(w / h, [0.0; 2]);
+                    let clip = vp * wpos.extend(1.0);
+                    let behind = clip.w <= 0.001;
+                    let inv_w = 1.0 / clip.w.abs().max(0.001);
+                    let ndc = clip.truncate().truncate() * inv_w;
+                    let mut sx = (ndc.x * 0.5 + 0.5) * w;
+                    let mut sy = (-ndc.y * 0.5 + 0.5) * h;
+                    if behind {
+                        // Derrière la caméra : le NDC se retourne -> on
+                        // symétrise puis on plaque sur le bord.
+                        sx = w - sx;
+                        sy = h - sy;
+                    }
+                    let on_screen = !behind && ndc.x.abs() < 0.97 && ndc.y.abs() < 0.94;
+                    if !on_screen {
+                        sx = sx.clamp(70.0, w - 70.0);
+                        sy = sy.clamp(84.0, h - 64.0);
+                    }
+                    let dist = g.pos.distance(wpos);
+                    Some(hud::Marker { sx, sy, on_screen, dist, kind })
+                });
                 if let Some(g) = self.game.as_ref() {
-                    hud::draw(&mut ui_ops, g, &font, self.lang, (w, h));
+                    hud::draw(&mut ui_ops, g, &font, self.lang, (w, h), marker);
                 }
                 // Ligne perf (haut-droite) : FPS + échelle de rendu + indicateur RT/upscaling.
                 // Sous 10 FPS on garde une décimale (un « 0 FPS » entier ne dit rien).

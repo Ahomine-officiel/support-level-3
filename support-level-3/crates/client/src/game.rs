@@ -573,6 +573,86 @@ impl Game {
         self.view_proj_mat(aspect, jitter_ndc).inverse().to_cols_array_2d()
     }
 
+    /// Matrice view_proj (projection écran des marqueurs d'objectif du HUD).
+    pub fn view_proj(&self, aspect: f32, jitter_ndc: [f32; 2]) -> glam::Mat4 {
+        self.view_proj_mat(aspect, jitter_ndc)
+    }
+
+    /// Objectif courant du guidage HUD : la prochaine chose à faire, la plus
+    /// proche du joueur d'abord. Priorité : batterie (si la nôtre est basse,
+    /// sinon on s'éteint en route) -> serveur hors ligne -> justificatif ->
+    /// terminal RH -> sortie. Renvoie (position monde à marquer, type) :
+    /// 0 = baie serveur · 1 = justificatif · 2 = terminal · 3 = sortie ·
+    /// 4 = batterie.
+    pub fn current_objective(&self) -> Option<(Vec3, u8)> {
+        let snap = self.snap.as_ref()?;
+        let d2 = |p: Vec3| {
+            let dx = p.x - self.pos.x;
+            let dz = p.z - self.pos.z;
+            dx * dx + dz * dz
+        };
+        let mut best: Option<(f32, Vec3, u8)> = None;
+
+        // Batterie en priorité quand la nôtre est presque morte ; on ignore
+        // celles déjà ramassées (snap.batteries : true = prise).
+        if self.battery < 35.0 {
+            for (i, b) in self.map.batteries.iter().enumerate() {
+                if snap.batteries.get(i).copied().unwrap_or(false) {
+                    continue;
+                }
+                let d = d2(*b);
+                if best.map_or(true, |(bd, _, _)| d < bd) {
+                    best = Some((d, *b, 4));
+                }
+            }
+            if let Some((_, p, k)) = best {
+                return Some((p + Vec3::new(0.0, 0.6, 0.0), k));
+            }
+        }
+
+        // 1) baies serveurs pas encore en ligne.
+        for (i, s) in self.map.servers.iter().enumerate() {
+            if snap.servers.get(i).map_or(false, |st| st.state != SRV_ONLINE) {
+                let d = d2(s.pos);
+                if best.map_or(true, |(bd, _, _)| d < bd) {
+                    best = Some((d, s.pos, 0));
+                }
+            }
+        }
+        if let Some((_, p, k)) = best {
+            return Some((p + Vec3::new(0.0, 1.4, 0.0), k));
+        }
+
+        // 2) justificatifs restants (snap.receipts : true = ramassé).
+        for (i, r) in self.map.receipts.iter().enumerate() {
+            if !snap.receipts.get(i).copied().unwrap_or(true) {
+                let d = d2(*r);
+                if best.map_or(true, |(bd, _, _)| d < bd) {
+                    best = Some((d, *r, 1));
+                }
+            }
+        }
+        if let Some((_, p, k)) = best {
+            return Some((p + Vec3::new(0.0, 0.6, 0.0), k));
+        }
+
+        // 3) terminal RH : la note de frais reste à valider.
+        if !snap.fee_approved {
+            return Some((self.map.terminal + Vec3::new(0.0, 1.2, 0.0), 2));
+        }
+
+        // 4) sortie ouverte -> porte de sortie.
+        if snap.exit_open {
+            if self.map.exit_cells.is_empty() {
+                return None;
+            }
+            let n = self.map.exit_cells.len() as f32;
+            let c = self.map.exit_cells.iter().copied().sum::<Vec3>() / n;
+            return Some((c + Vec3::new(0.0, 1.5, 0.0), 3));
+        }
+        None
+    }
+
     /// (proj * vue), avec décalage NDC du jitter subpixel (upscaling temporel).
     fn view_proj_mat(&self, aspect: f32, jitter_ndc: [f32; 2]) -> glam::Mat4 {
         let eye = self.cam_eye();
